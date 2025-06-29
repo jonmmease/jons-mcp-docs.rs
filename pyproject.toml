@@ -1,0 +1,73 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jons-mcp-docs-rs"
+version = "0.1.0"
+description = "An MCP server for looking up Rust documentation from docs.rs"
+readme = "README.md"
+authors = [
+    { name = "Jon M. Mease", email = "jon.mease@gmail.com" }
+]
+license = { file = "LICENSE" }
+keywords = ["mcp", "server", "rust", "documentation", "docs.rs", "fastmcp"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "fastmcp>=0.2.8",
+    "httpx>=0.27.0",
+    "html2text>=2024.2.26",
+    "beautifulsoup4>=4.12.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-timeout>=2.2.0",
+    "pytest-httpx>=0.30.0",
+]
+dev = [
+    "black>=24.0.0",
+    "ruff>=0.3.0",
+]
+
+[project.scripts]
+jons-mcp-docs-rs = "src.jons_mcp_docs_rs:main"
+
+[project.urls]
+Homepage = "https://github.com/jonmmease/jons-mcp-docs.rs"
+Repository = "https://github.com/jonmmease/jons-mcp-docs.rs"
+Issues = "https://github.com/jonmmease/jons-mcp-docs.rs/issues"
+
+[tool.setuptools]
+packages = ["src"]
+
+[tool.black]
+line-length = 88
+target-version = ['py310', 'py311', 'py312']
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+ignore = ["E501"]  # Line too long - let Black handle this
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+addopts = "-v --tb=short"
+asyncio_mode = "auto"
