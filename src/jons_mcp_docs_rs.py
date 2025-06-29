@@ -857,6 +857,7 @@ async def extract_code_examples(
         
         # Find all code examples in the documentation
         # Look for <div class="example-wrap"><pre class="rust rust-example-rendered"><code>
+        # Also look for language-specific examples like language-toml, language-sh
         example_wraps = soup.find_all("div", class_="example-wrap")
         
         for wrap in example_wraps:
@@ -864,26 +865,29 @@ async def extract_code_examples(
             if not pre_tag:
                 continue
                 
-            # Check if it's a Rust code example
+            # Determine language from classes
             classes = pre_tag.get("class", [])
-            if not any("rust" in cls for cls in classes):
-                # Also check for SQL or other languages if needed
-                language = "text"
-                if any("sql" in cls for cls in classes):
-                    language = "sql"
-                elif any("language-" in cls for cls in classes):
-                    for cls in classes:
+            language = "text"
+            
+            # Check for rust examples (can have multiple rust-related classes)
+            if any("rust" in str(cls) for cls in classes):
+                language = "rust"
+            # Check for language-specific classes
+            elif classes:
+                for cls in classes:
+                    if isinstance(cls, str):
                         if cls.startswith("language-"):
                             language = cls.replace("language-", "")
                             break
-            else:
-                language = "rust"
+                        elif cls in ["sql", "toml", "json", "yaml", "sh", "bash"]:
+                            language = cls
+                            break
             
             code_tag = pre_tag.find("code")
             if not code_tag:
                 continue
                 
-            code = code_tag.get_text(strip=True)
+            code = code_tag.get_text()
             
             # Skip empty blocks
             if not code:
@@ -945,9 +949,9 @@ async def extract_code_examples(
                         
                         # Look for examples in this page
                         for wrap in example_soup.find_all("div", class_="example-wrap"):
-                            pre_tag = wrap.find("pre", class_=lambda x: x and "rust" in str(x))
-                            if pre_tag and pre_tag.find("code"):
-                                code = pre_tag.find("code").get_text(strip=True)
+                            pre_tag = wrap.find("pre")
+                            if pre_tag and pre_tag.find("code") and any("rust" in str(cls) for cls in pre_tag.get("class", [])):
+                                code = pre_tag.find("code").get_text()
                                 if code and (not filter_text or filter_text.lower() in code.lower()):
                                     examples.append({
                                         "source_page": convert_url_to_key(example_url),
@@ -961,6 +965,30 @@ async def extract_code_examples(
                     
                     if len(examples) >= 10:
                         break
+        
+        # Pattern 2: Alternative documentation styles (e.g., GitBook)
+        # Look for <pre><code class="language-rust"> or <pre><code class="lang-rust">
+        if not examples:
+            for pre_tag in soup.find_all("pre"):
+                code_tag = pre_tag.find("code")
+                if code_tag:
+                    classes = code_tag.get("class", [])
+                    # Check for language indicators
+                    is_rust = any(c for c in classes if "rust" in c and ("lang" in c or "language" in c))
+                    
+                    if is_rust or (not classes and "fn " in code_tag.get_text()):
+                        code = code_tag.get_text()
+                        if code and (not filter_text or filter_text.lower() in code.lower()):
+                            examples.append({
+                                "source_page": page_key,
+                                "code": code,
+                                "language": "rust",
+                                "context": "Alternative format example",
+                                "is_complete": "fn main()" in code
+                            })
+                            
+                            if len(examples) >= 10:
+                                break
         
         # Fallback: If no examples found, provide raw markdown sections that might contain examples
         raw_sections = []
@@ -985,11 +1013,12 @@ async def extract_code_examples(
             "version": "latest",
             "search_pattern": filter_text,
             "examples": examples[:50],  # Limit to 50 examples
-            "total_examples": len(examples),
+            "total_found": len(examples),
             "debug_info": {
                 "page_searched": page_key,
                 "example_wraps_found": len(example_wraps),
-                "parsing_note": "If no examples found, check if the crate uses different documentation patterns or if examples are in separate pages."
+                "parsing_note": "If no examples found, the crate may not have inline examples on docs.rs. Some crates (like serde) have examples on separate tutorial sites.",
+                "suggestion": "Try searching for examples in the crate's source code using get_source_code on specific items."
             } if not examples else None,
             "fallback_raw_examples": raw_sections if not examples and raw_sections else None
         }
@@ -1188,52 +1217,64 @@ async def analyze_dependencies(
         
         # Look for dependencies in the sidebar menu
         # docs.rs shows dependencies in a <li class="pure-menu-heading">Dependencies</li> followed by items
-        sidebar = soup.find("nav", class_="sidebar") or soup.find("ul", class_="pure-menu-list")
+        # The dependencies are in a menu structure, not necessarily in nav.sidebar
+        dep_heading = None
         
-        if sidebar:
-            # Find the dependencies section
-            dep_heading = None
-            for li in sidebar.find_all("li", class_="pure-menu-heading"):
-                if "Dependencies" in li.get_text(strip=True):
-                    dep_heading = li
-                    break
-            
-            if dep_heading:
-                # Find the next sibling that contains the dependency list
-                dep_container = dep_heading.find_next_sibling("li", class_="pure-menu-item")
-                if dep_container:
-                    dep_submenu = dep_container.find("ul", class_="pure-menu-list")
-                    if dep_submenu:
-                        for dep_item in dep_submenu.find_all("li", class_="pure-menu-item"):
-                            link = dep_item.find("a")
-                            if link:
-                                # Parse dependency info
-                                dep_text = link.get_text(strip=True)
-                                # Look for dependency type indicator
-                                dep_type_elem = dep_item.find("i", class_="dependencies")
-                                dep_type = dep_type_elem.get_text(strip=True) if dep_type_elem else "normal"
+        # Search for the Dependencies heading in all pure-menu-heading elements
+        for li in soup.find_all("li", class_="pure-menu-heading"):
+            if "Dependencies" in li.get_text(strip=True):
+                dep_heading = li
+                break
+        
+        if dep_heading:
+            # Find the next sibling that contains the dependency list
+            dep_container = dep_heading.find_next_sibling("li", class_="pure-menu-item")
+            if dep_container:
+                dep_submenu = dep_container.find("ul", class_="pure-menu-list")
+                if dep_submenu:
+                    for dep_item in dep_submenu.find_all("li", class_="pure-menu-item"):
+                        link = dep_item.find("a")
+                        if link:
+                            # Parse dependency info
+                            # Get all text lines and clean them
+                            dep_text = link.get_text()
+                            lines = [line.strip() for line in dep_text.strip().split('\n') if line.strip()]
+                            
+                            if not lines:
+                                continue
                                 
-                                # Parse name and version from text like "arrow ^55.1.0"
-                                parts = dep_text.split()
-                                if len(parts) >= 2:
-                                    dep_name = parts[0]
-                                    dep_version = " ".join(parts[1:])
-                                    
-                                    dep_entry = {
-                                        "name": dep_name,
-                                        "version_req": dep_version,
-                                        "optional": dep_type == "optional"
-                                    }
-                                    
-                                    if link.get("href"):
-                                        dep_entry["url"] = f"https://docs.rs{link['href']}"
-                                    
-                                    if dep_type == "dev":
-                                        dev_dependencies.append(dep_entry)
-                                    elif dep_type == "build":
-                                        build_dependencies.append(dep_entry)
-                                    else:
-                                        dependencies.append(dep_entry)
+                            # First line contains name and version
+                            name_version = lines[0]
+                            parts = name_version.split()
+                            if len(parts) < 2:
+                                continue
+                                
+                            dep_name = parts[0]
+                            dep_version = " ".join(parts[1:])
+                            
+                            # Look for dependency type indicator in the dep_item, not the link
+                            dep_type_elem = dep_item.find("i", class_="dependencies")
+                            dep_type = dep_type_elem.get_text(strip=True) if dep_type_elem else "normal"
+                            
+                            # Check if optional (look in dep_item)
+                            optional_elem = dep_item.find("i", string="optional")
+                            is_optional = optional_elem is not None
+                            
+                            dep_entry = {
+                                "name": dep_name,
+                                "version_req": dep_version,
+                                "optional": is_optional
+                            }
+                            
+                            if link.get("href"):
+                                dep_entry["url"] = f"https://docs.rs{link['href']}"
+                            
+                            if dep_type == "dev":
+                                dev_dependencies.append(dep_entry)
+                            elif dep_type == "build":
+                                build_dependencies.append(dep_entry)
+                            else:
+                                dependencies.append(dep_entry)
         
         return {
             "crate": crate_name,
@@ -1246,8 +1287,7 @@ async def analyze_dependencies(
                 "total": len(dependencies) + len(dev_dependencies) + len(build_dependencies)
             },
             "debug_info": {
-                "sidebar_found": sidebar is not None,
-                "dependency_section_found": dep_heading is not None if sidebar else False,
+                "dependency_section_found": dep_heading is not None,
                 "parsing_note": "Dependencies are extracted from the sidebar menu. If empty, the crate may have no dependencies or uses a different layout."
             } if not dependencies and not dev_dependencies and not build_dependencies else None
         }
