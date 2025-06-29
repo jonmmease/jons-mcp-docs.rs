@@ -495,6 +495,172 @@ Compare documentation between two versions of a crate.
 }
 ```
 
+## Quick Start Guide
+
+### Learning from a Popular Crate
+
+Let's explore how to understand and implement a trait by learning from DataFusion:
+
+```python
+# 1. Find real implementations of a trait
+result = await find_trait_implementors("datafusion", "logical_expr/trait.ScalarUDFImpl")
+# Returns 121 implementations including ArrayToString, CoalesceFunc, etc.
+
+# 2. View the source of a specific implementation
+impl = result["implementors"][0]  # Pick one implementor
+source = await get_source_code(impl["key"])
+# Shows the complete implementation with line numbers
+
+# 3. Understand the module structure
+hierarchy = await get_module_hierarchy("datafusion", "functions", max_depth=3)
+# Shows all function modules and their organization
+```
+
+### Common Workflows
+
+#### "How do I implement trait X?"
+
+1. Find existing implementations:
+   ```python
+   impls = await find_trait_implementors("crate_name", "module/trait.TraitName")
+   ```
+
+2. Pick an implementor similar to your use case
+
+3. View its source code:
+   ```python
+   source = await get_source_code(impl["key"])
+   ```
+
+4. Look for patterns in method implementations, especially required methods
+
+#### "What examples exist for this crate?"
+
+1. Try to extract examples:
+   ```python
+   examples = await extract_code_examples("crate_name")
+   ```
+
+2. If empty (common for many crates), find real usage:
+   ```python
+   # Find trait implementors and view their source
+   impls = await find_trait_implementors("crate_name", "main_trait")
+   source = await get_source_code(impls["implementors"][0]["key"])
+   ```
+
+#### "How is this crate organized?"
+
+1. Get top-level view:
+   ```python
+   hierarchy = await get_module_hierarchy("crate_name")
+   ```
+
+2. Drill down into specific modules:
+   ```python
+   detailed = await get_module_hierarchy("crate_name", "specific_module", max_depth=3)
+   ```
+
+3. Navigate to specific items using the keys from hierarchy
+
+## Understanding Tool Results
+
+### When `extract_code_examples` Returns Empty
+
+This is **NORMAL** for many popular crates! For example:
+- **serde**: Hosts examples at serde.rs (separate site), not on docs.rs
+- **tokio**: Has examples, but not on all pages
+- **datafusion**: Most examples are in the implementors' source code
+
+**What to do:** Use `find_trait_implementors` + `get_source_code` for real examples.
+
+### When `analyze_dependencies` Shows Optional Dependencies
+
+- `optional: true` means the dependency is behind a feature flag
+- Check the crate's features to understand when it's included
+- Dependencies marked as `dev` are only used for testing
+- Dependencies marked as `build` are only used during compilation
+
+### Understanding Debug Information
+
+All tools provide `debug_info` when results might be unexpected:
+- Explains what was searched
+- Indicates why results might be empty
+- Suggests alternative approaches
+
+## Tool Philosophy
+
+These tools embrace the reality that Rust documentation exists in multiple forms:
+
+1. **API Reference** (always on docs.rs)
+   - Type signatures, trait definitions, module structure
+   - Use: `lookup_pages`, `get_module_hierarchy`
+
+2. **Inline Examples** (sometimes on docs.rs)
+   - Some crates include examples, many don't
+   - Use: `extract_code_examples`
+
+3. **Real Implementations** (always available via source)
+   - The most valuable learning resource
+   - Use: `find_trait_implementors` + `get_source_code`
+
+4. **External Resources** (not accessible via these tools)
+   - Many crates host tutorials elsewhere (serde.rs, tokio.rs, etc.)
+   - The tools will indicate when this might be the case
+
+## What These Tools Can and Cannot Do
+
+### ✅ CAN DO:
+- Navigate any crate's complete module structure
+- Find all implementors of any public trait
+- View source code with syntax highlighting and line numbers
+- Analyze all dependencies and feature flags
+- Compare API surfaces between versions
+- Extract code examples when present
+- Provide navigation keys for seamless browsing
+
+### ❌ CANNOT DO:
+- Access external documentation sites (e.g., serde.rs)
+- Run or execute code examples
+- Search across multiple crates simultaneously
+- Access private or internal implementations
+- View documentation for crates not on docs.rs
+
+### 🤔 DEPENDS ON THE CRATE:
+- Extract inline examples (many crates don't include them)
+- Find usage examples in tests (not all test source is published)
+- View macro implementations (depends on macro structure)
+
+## Troubleshooting
+
+### "Why am I getting empty results?"
+
+1. **Check the `debug_info` field** - It explains what was searched and why it might be empty
+
+2. **Try different approaches:**
+   - No examples? → Use implementors + source code
+   - No implementors? → The trait might be in a different module or crate
+   - No dependencies? → The crate might be no_std or very minimal
+
+3. **Use the navigation keys:**
+   - Results include `key` fields that work with other tools
+   - Example: Use a key from `find_trait_implementors` in `get_source_code`
+
+### "How do I know which tool to use?"
+
+- **Want to see how something is used?** → `find_trait_implementors`
+- **Need the actual code?** → `get_source_code`
+- **Exploring a new crate?** → `get_module_hierarchy`
+- **Checking what a crate depends on?** → `analyze_dependencies`
+- **Looking for examples?** → `extract_code_examples` (but expect empty for many crates)
+- **Comparing versions?** → `compare_versions`
+
+### "The tool returned an error"
+
+- **404 errors**: The crate/version/module might not exist
+- **Parsing errors**: The page might use a non-standard format
+- **Network errors**: Retry the request
+- **Check fallback data**: Look for `fallback_*` fields in the response
+
 ## Navigation System
 
 The server converts docs.rs URLs into navigation keys that can be used with the `lookup_pages` tool. This allows AI assistants to navigate the documentation site without dealing with URLs directly.
@@ -514,6 +680,61 @@ All links in the documentation are automatically transformed to use the `docs.rs
 1. Call `lookup_main_page` to get the main page and extract links
 2. Use the `key` field from links with `lookup_pages` to navigate to specific pages
 3. Search results also provide keys for direct navigation
+
+## Combining Tools for Maximum Insight
+
+### Example: Deep Understanding of a Complex Trait
+
+```python
+# Goal: Understand how to implement AsyncRead trait
+
+# 1. Find all implementors
+impls = await find_trait_implementors("tokio", "io/trait.AsyncRead")
+
+# 2. Group by module to understand organization patterns
+by_module = {}
+for impl in impls["implementors"]:
+    module = impl["module"]
+    by_module.setdefault(module, []).append(impl)
+
+# 3. Study different implementation strategies
+for module, implementors in by_module.items():
+    print(f"\nModule {module}:")
+    for impl in implementors[:2]:  # First 2 from each module
+        source = await get_source_code(impl["key"])
+        # Analyze implementation patterns
+
+# 4. Check how the trait evolved
+versions = await compare_versions("tokio", "1.0.0", "1.35.0")
+# See what methods were added/removed
+```
+
+### Example: Exploring a New Crate
+
+```python
+# Goal: Understand DataFusion's architecture
+
+# 1. Start with dependencies
+deps = await analyze_dependencies("datafusion")
+print(f"Built on: {[d['name'] for d in deps['dependencies']['direct'][:5]]}")
+
+# 2. Explore module structure
+hierarchy = await get_module_hierarchy("datafusion", max_depth=2)
+# Identify key modules: logical_expr, physical_plan, execution
+
+# 3. Find core traits
+logical_page = await lookup_pages(["datafusion/latest/datafusion/logical_expr"])
+# Look for trait definitions in the content
+
+# 4. See implementations
+impls = await find_trait_implementors("datafusion", "logical_expr/trait.ScalarUDFImpl")
+# 121 implementations! Let's study a few
+
+# 5. Extract patterns from source
+for impl in impls["implementors"][:3]:
+    source = await get_source_code(impl["key"])
+    # Look for common patterns in invoke() and return_type() methods
+```
 
 ## Development
 
