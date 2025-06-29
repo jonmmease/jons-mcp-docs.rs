@@ -130,7 +130,25 @@ async def lookup_main_page(
         limit: Maximum number of characters to return
 
     Returns:
-        A dictionary containing the documentation content, links, and pagination info
+        A dictionary containing:
+        - crate: The crate name
+        - version: The version being viewed
+        - content: The documentation content as markdown
+        - total_characters: Total length of the full content
+        - offset: The starting position of this chunk
+        - limit: Maximum characters requested
+        - has_more: Boolean indicating if more content exists beyond this chunk
+        - links: List of extracted links (limited to first 20), each containing:
+            - key: Navigation key to use with lookup_pages tool
+            - text: Display text of the link
+            - url: Full URL of the link
+        - total_links: Total number of links found on the page
+        - url: The final URL after any redirects
+
+        The 'key' values in links can be passed directly to the lookup_pages tool
+        to navigate to those specific documentation pages. For example, if a link
+        has key "tokio/latest/tokio/runtime/struct.Runtime", you can pass this
+        exact string to lookup_pages to view that struct's documentation.
     """
     try:
         version = version or DEFAULT_VERSION
@@ -193,7 +211,28 @@ async def lookup_pages(
         limit: Maximum number of characters to return across all pages
 
     Returns:
-        A dictionary containing the combined documentation content with pagination
+        A dictionary containing:
+        - pages: List of page results, each containing:
+            - key: The page key that was requested
+            - url: The final URL of the page
+            - content_length: Total length of this page's content
+            - links_count: Number of links found on this page
+            - error: Error message if the page failed to load (optional)
+        - content: Combined markdown content from all pages
+        - total_characters: Total length of all combined content
+        - offset: The starting position of this chunk
+        - limit: Maximum characters requested
+        - has_more: Boolean indicating if more content exists beyond this chunk
+        - pages_count: Number of pages requested
+
+        Page keys can be obtained from:
+        1. The 'key' field in links returned by lookup_main_page
+        2. The 'key' field in search results from search_docs
+        3. Manually constructed using the pattern: "crate/version/path/to/item"
+
+        Example: To view DataFrame documentation after finding it in search results,
+        pass its key "datafusion/latest/datafusion/dataframe/struct.DataFrame"
+        to this tool.
     """
     results = []
     combined_content = []
@@ -271,7 +310,24 @@ async def search_docs(
         limit: Maximum number of results to return
 
     Returns:
-        A dictionary containing search results with pagination info
+        A dictionary containing:
+        - crate: The crate name that was searched
+        - version: The version that was searched
+        - query: The search query used
+        - results: List of search results, each containing:
+            - key: Navigation key to use with lookup_pages tool
+            - title: Display title of the result
+            - url: Full URL of the result
+            - snippet: Text snippet (currently empty in basic parsing)
+        - total_results: Total number of results found
+        - offset: The starting position in the results
+        - limit: Maximum results requested
+        - has_more: Boolean indicating if more results exist beyond this chunk
+        - search_url: The actual search URL used
+
+        The 'key' field in each result can be passed to the lookup_pages tool
+        to view the full documentation for that item. This enables navigation
+        from search results directly to the relevant documentation pages.
     """
     try:
         version = version or DEFAULT_VERSION
@@ -358,7 +414,26 @@ async def search_crates(
         page: Page number (1-indexed) for pagination
 
     Returns:
-        A dictionary containing crate search results with pagination info
+        A dictionary containing:
+        - query: The search query used
+        - page: The current page number
+        - crates: List of found crates, each containing:
+            - name: The crate name
+            - version: Latest version of the crate
+            - description: Brief description of the crate
+            - date: Publication date (ISO format)
+            - url: Direct URL to the crate's documentation
+        - total_on_page: Number of crates on this page
+        - has_next_page: Boolean indicating if more pages are available
+        - search_url: The actual search URL used
+        - error: Error message if something went wrong (optional)
+
+        Note: docs.rs uses token-based pagination internally, but this tool
+        abstracts it to simple page numbers. To get results from page 2+,
+        the tool will automatically fetch intermediate pages as needed.
+
+        The URLs in the crate results point directly to each crate's main
+        documentation page, which can then be explored using lookup_main_page.
     """
     try:
         # For page 1, use the simple search URL
@@ -415,7 +490,7 @@ async def search_crates(
                 # Parse crate name and version from "crate-name-version" format
                 full_name = name_div.get_text(strip=True)
                 # Find the last hyphen followed by a version number
-                match = re.match(r"^(.+)-(\d+\.\d+\.\d+(?:-[\w\.]+)?)$", full_name)
+                match = re.match(r"^(.+)-(\d+\.\d+\.\d+(?:-[\w.]+)?)$", full_name)
                 if match:
                     crate_name = match.group(1)
                     version = match.group(2)
