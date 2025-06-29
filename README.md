@@ -11,13 +11,25 @@ This MCP server enables AI assistants to browse and search Rust crate documentat
 - Searching within crate documentation
 - Searching for crates by name with pagination
 - Converting docs.rs URLs to navigation keys for seamless browsing
+- Viewing source code for any Rust item
+- Extracting code examples from documentation
+- Finding trait implementors
+- Analyzing crate dependencies
+- Exploring module hierarchies
+- Comparing API changes between versions
 
 ## Features
 
 - **Main Page Lookup**: Fetch the main documentation page for any Rust crate with configurable version
-- **Multi-Page Lookup**: Fetch multiple documentation pages in a single request with combined pagination
+- **Multi-Page Lookup**: Fetch multiple documentation pages in a single request with combined pagination and source availability detection
 - **Search Functionality**: Search within a crate's documentation and get paginated results
 - **Crate Search**: Search for crates by name across the entire docs.rs catalog
+- **Source Code Viewing**: Access the source code of any Rust item directly from docs.rs
+- **Code Example Extraction**: Extract and filter code examples from documentation
+- **Trait Analysis**: Find all types that implement a specific trait
+- **Dependency Analysis**: Analyze and extract crate dependencies from documentation
+- **Module Hierarchy**: Explore the complete module structure of a crate
+- **Version Comparison**: Compare API surface or content between different versions
 - **Smart Pagination**: Character-based pagination for handling large documentation
 - **Link Extraction**: Automatically extract and convert links to navigation keys
 - **Version Control**: Support for specific crate versions or default to latest
@@ -139,7 +151,8 @@ Fetch one or more specific documentation pages.
       "key": "datafusion/latest/datafusion/dataframe/struct.DataFrame",
       "url": "https://docs.rs/datafusion/latest/datafusion/dataframe/struct.DataFrame.html",
       "content_length": 15000,
-      "links_count": 45
+      "links_count": 45,
+      "source_available": true
     }
   ],
   "content": "# Page: datafusion/latest/datafusion/dataframe/struct.DataFrame\n\n...",
@@ -150,6 +163,8 @@ Fetch one or more specific documentation pages.
   "pages_count": 2
 }
 ```
+
+**Note**: The `source_available` field indicates whether source code can be viewed for this item using the `get_source_code` tool.
 
 ### search_docs
 
@@ -231,9 +246,263 @@ Search for Rust crates by name on docs.rs.
 }
 ```
 
+### get_source_code
+
+Get the source code for a Rust item from the source viewer.
+
+**Parameters:**
+- `page_key` (required): The page key for the item (e.g., "tokio/latest/tokio/runtime/struct.Runtime")
+- `offset` (optional): Character offset for pagination (default: 0)
+- `limit` (optional): Maximum number of characters to return (default: 50)
+
+**Example:**
+```json
+{
+  "page_key": "datafusion/latest/datafusion/logical_expr/trait.ScalarUDFImpl",
+  "offset": 0,
+  "limit": 2000
+}
+```
+
+**Response:**
+```json
+{
+  "page_key": "datafusion/latest/datafusion/logical_expr/trait.ScalarUDFImpl",
+  "source_code": "pub trait ScalarUDFImpl: Debug + Send + Sync {\n    ...",
+  "total_characters": 5000,
+  "offset": 0,
+  "limit": 2000,
+  "has_more": true,
+  "url": "https://docs.rs/datafusion/latest/src/datafusion/logical_expr/udf.rs.html#123"
+}
+```
+
+### extract_code_examples
+
+Extract code examples from documentation.
+
+**Parameters:**
+- `crate_name` (required): The name of the crate
+- `search_pattern` (optional): Pattern to search for in examples (e.g., "DataFrame")
+- `version` (optional): Version of the crate (defaults to "latest")
+- `max_examples` (optional): Maximum number of examples to return (default: 10)
+
+**Example:**
+```json
+{
+  "crate_name": "datafusion",
+  "search_pattern": "SessionContext",
+  "max_examples": 5
+}
+```
+
+**Response:**
+```json
+{
+  "crate": "datafusion",
+  "version": "latest",
+  "search_pattern": "SessionContext",
+  "examples": [
+    {
+      "source_page": "datafusion/latest/datafusion",
+      "code": "use datafusion::prelude::*;\n\nlet ctx = SessionContext::new();\n...",
+      "language": "rust",
+      "context": "Creating a new SessionContext"
+    }
+  ],
+  "total_examples": 5
+}
+```
+
+### find_trait_implementors
+
+Find types that implement a specific trait.
+
+**Parameters:**
+- `crate_name` (required): The name of the crate containing the trait
+- `trait_path` (required): Path to the trait (e.g., "prelude/trait.Debug")
+- `version` (optional): Version of the crate (defaults to "latest")
+
+**Example:**
+```json
+{
+  "crate_name": "datafusion",
+  "trait_path": "logical_expr/trait.ScalarUDFImpl"
+}
+```
+
+**Response:**
+```json
+{
+  "crate": "datafusion",
+  "version": "latest",
+  "trait_path": "logical_expr/trait.ScalarUDFImpl",
+  "trait_url": "https://docs.rs/datafusion/latest/datafusion/logical_expr/trait.ScalarUDFImpl.html",
+  "implementors": [
+    {
+      "name": "ArrayToString",
+      "key": "datafusion/latest/datafusion/functions_array/struct.ArrayToString",
+      "module": "functions_array"
+    }
+  ],
+  "total_implementors": 15,
+  "direct_implementors": 10,
+  "blanket_implementors": 5
+}
+```
+
+### analyze_dependencies
+
+Analyze a crate's dependencies from its documentation.
+
+**Parameters:**
+- `crate_name` (required): The name of the crate
+- `version` (optional): Version of the crate (defaults to "latest")
+
+**Example:**
+```json
+{
+  "crate_name": "tokio",
+  "version": "latest"
+}
+```
+
+**Response:**
+```json
+{
+  "crate": "tokio",
+  "version": "latest",
+  "dependencies": {
+    "direct": [
+      {
+        "name": "mio",
+        "url": "https://docs.rs/mio",
+        "context": "Event notification library"
+      }
+    ],
+    "features": [
+      {
+        "name": "full",
+        "dependencies": ["rt", "macros", "sync", "time"]
+      }
+    ],
+    "total": 15
+  }
+}
+```
+
+### get_module_hierarchy
+
+Get the module structure and hierarchy of a crate.
+
+**Parameters:**
+- `crate_name` (required): The name of the crate
+- `start_module` (optional): Starting module path (defaults to root)
+- `max_depth` (optional): Maximum depth to traverse (default: 3)
+- `version` (optional): Version of the crate (defaults to "latest")
+
+**Example:**
+```json
+{
+  "crate_name": "datafusion",
+  "max_depth": 2
+}
+```
+
+**Response:**
+```json
+{
+  "crate": "datafusion",
+  "version": "latest",
+  "start_module": "root",
+  "modules": {
+    "name": "datafusion",
+    "path": "datafusion/latest/datafusion",
+    "key": "datafusion/latest/datafusion",
+    "submodules": [
+      {
+        "name": "prelude",
+        "path": "datafusion/latest/datafusion/prelude",
+        "items": {
+          "structs": ["DataFrame", "SessionContext"],
+          "traits": ["TableProvider"]
+        }
+      }
+    ],
+    "items": {
+      "structs": ["DataFrame"],
+      "enums": ["DataFusionError"],
+      "traits": []
+    }
+  },
+  "total_modules": 25,
+  "max_depth": 2
+}
+```
+
+### compare_versions
+
+Compare documentation between two versions of a crate.
+
+**Parameters:**
+- `crate_name` (required): The name of the crate
+- `version1` (required): First version to compare
+- `version2` (required): Second version to compare
+- `page_path` (optional): Specific page to compare (for full_content comparison)
+- `comparison_type` (optional): "api_surface" (default) or "full_content"
+
+**Example (API Surface Comparison):**
+```json
+{
+  "crate_name": "tokio",
+  "version1": "1.0.0",
+  "version2": "1.35.0",
+  "comparison_type": "api_surface"
+}
+```
+
+**Response:**
+```json
+{
+  "crate": "tokio",
+  "version1": "1.0.0",
+  "version2": "1.35.0",
+  "comparison_type": "api_surface",
+  "differences": {
+    "added": {
+      "structs": ["JoinSet", "LocalSet"],
+      "functions": ["spawn_blocking"]
+    },
+    "removed": {
+      "structs": ["Runtime::spawn"]
+    },
+    "common": {
+      "structs": ["Runtime", "JoinHandle"]
+    },
+    "summary": "5 items added, 1 items removed"
+  }
+}
+```
+
+**Example (Full Content Comparison):**
+```json
+{
+  "crate_name": "serde",
+  "version1": "1.0.0",
+  "version2": "1.0.100",
+  "page_path": "ser/trait.Serialize",
+  "comparison_type": "full_content"
+}
+```
+
 ## Navigation System
 
 The server converts docs.rs URLs into navigation keys that can be used with the `lookup_pages` tool. This allows AI assistants to navigate the documentation site without dealing with URLs directly.
+
+All links in the documentation are automatically transformed to use the `docs.rs://` protocol, which provides a consistent format for navigation. This includes:
+- docs.rs links (e.g., `https://docs.rs/...` → `docs.rs://...`)
+- doc.rust-lang.org links (e.g., `https://doc.rust-lang.org/...` → `docs.rs://rust-lang/...`)
+- Relative links are resolved to absolute `docs.rs://` format
 
 ### URL to Key Conversion Examples:
 
