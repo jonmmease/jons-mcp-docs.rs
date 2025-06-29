@@ -848,83 +848,150 @@ async def extract_code_examples(
         else:
             page_key = f"{crate_name}/latest/{crate_name}"
         
-        # Fetch the documentation page
-        result = await lookup_main_page(crate_name, limit=MAX_CONTENT_LENGTH)
-        
-        if "error" in result:
-            return {
-                "crate": crate_name,
-                "error": result["error"]
-            }
-        
-        content = result["content"]
-        
-        # Extract code blocks using regex
-        # Match ```rust or ```{.rust or ``` blocks
-        code_pattern = re.compile(
-            r'```(?:rust|{\.rust.*?}|)\s*\n(.*?)\n```',
-            re.DOTALL | re.MULTILINE
-        )
+        # Fetch the documentation page HTML directly
+        url = f"{BASE_URL}/{page_key}/index.html"
+        html_content, final_url = await fetch_page(url)
+        soup = BeautifulSoup(html_content, "html.parser")
         
         examples = []
         
-        for match in code_pattern.finditer(content):
-            code = match.group(1).strip()
+        # Find all code examples in the documentation
+        # Look for <div class="example-wrap"><pre class="rust rust-example-rendered"><code>
+        example_wraps = soup.find_all("div", class_="example-wrap")
+        
+        for wrap in example_wraps:
+            pre_tag = wrap.find("pre")
+            if not pre_tag:
+                continue
+                
+            # Check if it's a Rust code example
+            classes = pre_tag.get("class", [])
+            if not any("rust" in cls for cls in classes):
+                # Also check for SQL or other languages if needed
+                language = "text"
+                if any("sql" in cls for cls in classes):
+                    language = "sql"
+                elif any("language-" in cls for cls in classes):
+                    for cls in classes:
+                        if cls.startswith("language-"):
+                            language = cls.replace("language-", "")
+                            break
+            else:
+                language = "rust"
+            
+            code_tag = pre_tag.find("code")
+            if not code_tag:
+                continue
+                
+            code = code_tag.get_text(strip=True)
             
             # Skip empty blocks
             if not code:
-                continue
-            
-            # Determine if it's a complete example
-            is_complete = (
-                "fn main()" in code or
-                "#[test]" in code or
-                "#[cfg(test)]" in code or
-                (code.count("{") == code.count("}") and "fn " in code and code.count("{") > 2)
-            )
-            
-            # Skip if only_complete is True and this isn't complete
-            if only_complete and not is_complete:
                 continue
             
             # Skip if filter_text is provided and not found
             if filter_text and filter_text.lower() not in code.lower():
                 continue
             
-            # Get context (text before the code block)
-            start_pos = max(0, match.start() - 200)
-            context = content[start_pos:match.start()].strip()
-            if start_pos > 0:
-                context = "..." + context
+            # Determine if it's a complete example (for Rust code)
+            is_complete = False
+            if language == "rust":
+                is_complete = (
+                    "fn main()" in code or
+                    "#[test]" in code or
+                    "#[cfg(test)]" in code or
+                    (code.count("{") == code.count("}") and "fn " in code and code.count("{") > 2)
+                )
+                
+                # Skip if only_complete is True and this isn't complete
+                if only_complete and not is_complete:
+                    continue
             
-            # Extract module from context or use main
-            module = "main"
-            if "## " in context:
-                # Look for module header
-                module_match = re.search(r'## (?:Module |Struct |Trait |Function )?(\w+)', context)
-                if module_match:
-                    module = module_match.group(1)
+            # Get context - look for preceding text
+            context = ""
+            # Find the nearest preceding heading or paragraph
+            prev = wrap.find_previous_sibling(["p", "h1", "h2", "h3", "h4", "h5"])
+            if prev:
+                context = prev.get_text(strip=True)[:200]
+            
+            # Determine source page/module
+            source_page = page_key
+            # Try to find the section this example is in
+            section = wrap.find_parent("section")
+            if section and section.get("id"):
+                source_page = f"{page_key}#{section.get('id')}"
             
             examples.append({
+                "source_page": source_page,
                 "code": code,
-                "language": "rust",
-                "context": context[-200:],  # Limit context length
-                "module": module,
-                "is_complete": is_complete
+                "language": language,
+                "context": context,
+                "is_complete": is_complete if language == "rust" else None
             })
         
-        # If we have many examples, prioritize complete ones
-        if len(examples) > 20 and not only_complete:
-            complete = [e for e in examples if e["is_complete"]]
-            incomplete = [e for e in examples if not e["is_complete"]]
-            examples = complete + incomplete[:20 - len(complete)]
+        # If no examples found in main page and no module specified, try to get from subpages
+        if not examples and not module_path:
+            # Look for links to common example pages
+            links = soup.find_all("a", href=True)
+            for link in links:
+                href = link.get("href", "")
+                text = link.get_text(strip=True).lower()
+                if any(keyword in text for keyword in ["example", "usage", "quick start", "getting started"]):
+                    # Fetch this page too
+                    example_url = urljoin(final_url, href)
+                    try:
+                        example_html, _ = await fetch_page(example_url)
+                        example_soup = BeautifulSoup(example_html, "html.parser")
+                        
+                        # Look for examples in this page
+                        for wrap in example_soup.find_all("div", class_="example-wrap"):
+                            pre_tag = wrap.find("pre", class_=lambda x: x and "rust" in str(x))
+                            if pre_tag and pre_tag.find("code"):
+                                code = pre_tag.find("code").get_text(strip=True)
+                                if code and (not filter_text or filter_text.lower() in code.lower()):
+                                    examples.append({
+                                        "source_page": convert_url_to_key(example_url),
+                                        "code": code,
+                                        "language": "rust",
+                                        "context": f"From {text}",
+                                        "is_complete": "fn main()" in code
+                                    })
+                    except Exception:
+                        pass
+                    
+                    if len(examples) >= 10:
+                        break
         
+        # Fallback: If no examples found, provide raw markdown sections that might contain examples
+        raw_sections = []
+        if not examples:
+            # Look for any pre/code blocks in the markdown content
+            try:
+                # Get the raw markdown content
+                result = await lookup_main_page(crate_name, limit=10000)
+                if "content" in result and not result.get("error"):
+                    content = result["content"]
+                    # Find any code-like sections
+                    code_pattern = re.compile(r'```[\s\S]*?```', re.MULTILINE)
+                    raw_code_blocks = code_pattern.findall(content)
+                    if raw_code_blocks:
+                        raw_sections = raw_code_blocks[:5]  # Limit to first 5
+            except Exception:
+                pass
+        
+        # Limit results
         return {
             "crate": crate_name,
-            "module_path": module_path,
+            "version": "latest",
+            "search_pattern": filter_text,
             "examples": examples[:50],  # Limit to 50 examples
-            "total_found": len(examples),
-            "filtered_count": len(examples) if filter_text or only_complete else None
+            "total_examples": len(examples),
+            "debug_info": {
+                "page_searched": page_key,
+                "example_wraps_found": len(example_wraps),
+                "parsing_note": "If no examples found, check if the crate uses different documentation patterns or if examples are in separate pages."
+            } if not examples else None,
+            "fallback_raw_examples": raw_sections if not examples and raw_sections else None
         }
         
     except Exception as e:
@@ -983,31 +1050,25 @@ async def find_trait_implementors(
         foreign_count = 0
         
         # Look for implementors section
-        # docs.rs typically has <h2 id="implementors">Implementors</h2>
-        implementors_section = soup.find("h2", id="implementors")
+        # docs.rs uses <div id="implementors-list"> for the implementors
+        implementors_list = soup.find("div", id="implementors-list")
         
-        if implementors_section:
-            # Find the next sibling div or section that contains the implementors
-            current = implementors_section.find_next_sibling()
-            
-            while current and current.name not in ["h2", "h1"]:
-                # Look for implementor entries
-                if current.name == "div" and "impl" in current.get("class", []):
-                    # Extract implementor information
-                    code_elem = current.find("code")
-                    if code_elem:
-                        impl_text = code_elem.get_text()
-                        
-                        # Parse the impl text to extract type name
-                        # Pattern: "impl TraitName for TypeName"
-                        impl_match = re.search(r'impl\s+(?:\S+\s+for\s+)?(\S+)', impl_text)
-                        if impl_match:
-                            type_name = impl_match.group(1)
-                            
-                            # Try to find a link to the type
-                            type_link = current.find("a", href=True)
-                            if type_link:
-                                href = type_link["href"]
+        if implementors_list:
+            # Find all section elements with class "impl"
+            for section in implementors_list.find_all("section", class_="impl"):
+                # Look for the impl header
+                impl_header = section.find("h3", class_="code-header")
+                if impl_header:
+                    # Find the type that implements the trait
+                    # Look for the last link which is usually the implementing type
+                    links = impl_header.find_all("a", href=True)
+                    if links:
+                        # Usually the last link is the implementing type
+                        for link in reversed(links):
+                            if "trait" not in link.get("class", []):
+                                type_name = link.get_text(strip=True)
+                                href = link["href"]
+                                
                                 # Convert to navigation key
                                 absolute_url = urljoin(final_url, href)
                                 key = convert_url_to_key(absolute_url)
@@ -1020,61 +1081,51 @@ async def find_trait_implementors(
                                     module = "root"
                                 
                                 implementors.append({
-                                    "type_name": type_name,
+                                    "name": type_name,
                                     "key": key,
-                                    "in_crate": crate_name in key,
                                     "module": module
                                 })
-                            else:
-                                # No link, might be a local/private type
-                                implementors.append({
-                                    "type_name": type_name,
-                                    "key": None,
-                                    "in_crate": True,
-                                    "module": "unknown"
-                                })
-                
-                current = current.find_next_sibling()
+                                break
         
-        # Also check for foreign implementors section
-        foreign_section = soup.find("h2", id="foreign-impls")
-        if foreign_section:
-            # Count foreign implementors (we can't get full details)
-            current = foreign_section.find_next_sibling()
-            while current and current.name not in ["h2", "h1"]:
-                if current.name == "div" and "impl" in current.get("class", []):
-                    foreign_count += 1
-                current = current.find_next_sibling()
+        # Count direct vs blanket implementors
+        direct_count = len(implementors)
+        blanket_count = 0
         
-        # Alternative: Look for a simpler list format
-        if not implementors:
-            # Try finding ul.impl-list or similar
-            impl_list = soup.find("ul", class_=lambda x: x and "impl" in x)
-            if impl_list:
-                for li in impl_list.find_all("li"):
-                    link = li.find("a")
-                    if link and link.get("href"):
-                        type_name = link.get_text(strip=True)
-                        href = link["href"]
-                        absolute_url = urljoin(final_url, href)
-                        key = convert_url_to_key(absolute_url)
-                        
-                        implementors.append({
-                            "type_name": type_name,
-                            "key": key,
-                            "in_crate": crate_name in key,
-                            "module": "unknown"
-                        })
+        # Look for blanket implementors section
+        blanket_section = soup.find("div", id="blanket-implementors-list")
+        if blanket_section:
+            blanket_impls = blanket_section.find_all("section", class_="impl")
+            blanket_count = len(blanket_impls)
+        
+        # Fallback: If no implementors found, look for any impl blocks in the content
+        fallback_impl_text = None
+        if not implementors and not blanket_count:
+            # Try to find any text mentioning implementations
+            content = soup.find("div", class_="content") or soup.find("main")
+            if content:
+                # Look for any text containing "impl" or "implemented"
+                impl_texts = []
+                for elem in content.find_all(text=re.compile(r'impl.*for|implemented.*by', re.I)):
+                    if elem.strip():
+                        impl_texts.append(elem.strip()[:200])
+                if impl_texts:
+                    fallback_impl_text = "\n".join(impl_texts[:5])
         
         return {
             "crate": crate_name,
             "version": version,
             "trait_path": trait_path,
-            "trait_name": trait_name,
+            "trait_url": final_url,
             "implementors": implementors,
-            "foreign_implementors": foreign_count,
-            "total_implementors": len(implementors) + foreign_count,
-            "page_url": final_url
+            "total_implementors": direct_count + blanket_count,
+            "direct_implementors": direct_count,
+            "blanket_implementors": blanket_count,
+            "debug_info": {
+                "implementors_list_found": implementors_list is not None,
+                "blanket_list_found": blanket_section is not None,
+                "parsing_note": "If no implementors found, the trait may have no direct implementors or uses a different HTML structure."
+            } if not implementors else None,
+            "fallback_impl_mentions": fallback_impl_text
         }
         
     except httpx.HTTPError as e:
@@ -1135,118 +1186,70 @@ async def analyze_dependencies(
         build_dependencies = []
         features = {}
         
-        # Look for dependencies in the sidebar
-        # docs.rs typically shows these in <div class="block dependencies">
-        dep_sections = soup.find_all("div", class_="block")
+        # Look for dependencies in the sidebar menu
+        # docs.rs shows dependencies in a <li class="pure-menu-heading">Dependencies</li> followed by items
+        sidebar = soup.find("nav", class_="sidebar") or soup.find("ul", class_="pure-menu-list")
         
-        for section in dep_sections:
-            header = section.find(["h3", "h2"])
-            if not header:
-                continue
-                
-            header_text = header.get_text(strip=True).lower()
+        if sidebar:
+            # Find the dependencies section
+            dep_heading = None
+            for li in sidebar.find_all("li", class_="pure-menu-heading"):
+                if "Dependencies" in li.get_text(strip=True):
+                    dep_heading = li
+                    break
             
-            if "dependencies" in header_text:
-                # Determine dependency type
-                is_dev = "dev" in header_text
-                is_build = "build" in header_text
-                
-                # Find dependency list
-                dep_list = section.find("ul")
-                if dep_list:
-                    for li in dep_list.find_all("li"):
-                        # Parse dependency entry
-                        dep_text = li.get_text(strip=True)
-                        
-                        # Extract name and version
-                        # Format: "name version (optional)"
-                        match = re.match(r'(\S+)\s+([^\s(]+)(?:\s+\((.*?)\))?', dep_text)
-                        if match:
-                            dep_name = match.group(1)
-                            dep_version = match.group(2)
-                            dep_flags = match.group(3) or ""
-                            
-                            dep_entry = {
-                                "name": dep_name,
-                                "version_req": dep_version,
-                                "optional": "optional" in dep_flags,
-                                "features": []  # docs.rs doesn't show enabled features
-                            }
-                            
-                            # Check if it's also a link
-                            link = li.find("a")
-                            if link and link.get("href"):
-                                dep_entry["docs_url"] = urljoin(BASE_URL, link["href"])
-                            
-                            if is_dev:
-                                dev_dependencies.append(dep_entry)
-                            elif is_build:
-                                build_dependencies.append(dep_entry)
-                            else:
-                                dependencies.append(dep_entry)
-            
-            elif "features" in header_text:
-                # Parse features section
-                feature_list = section.find("ul")
-                if feature_list:
-                    for li in feature_list.find_all("li"):
-                        feature_text = li.get_text(strip=True)
-                        
-                        # Parse feature format: "feature_name = [dep1, dep2]"
-                        match = re.match(r'(\S+)\s*=\s*\[(.*?)]', feature_text)
-                        if match:
-                            feature_name = match.group(1)
-                            feature_deps = [
-                                dep.strip().strip('"') 
-                                for dep in match.group(2).split(",") 
-                                if dep.strip()
-                            ]
-                            features[feature_name] = feature_deps
-                        else:
-                            # Simple feature flag
-                            features[feature_text] = []
-        
-        # Alternative: Look for dependency information in a different format
-        if not dependencies and not dev_dependencies and not build_dependencies:
-            # Try to find in the main content area
-            content = soup.find("div", class_="content") or soup.find("main")
-            if content:
-                # Look for sections with dependency info
-                for heading in content.find_all(["h2", "h3"]):
-                    if "dependencies" in heading.get_text(strip=True).lower():
-                        next_elem = heading.find_next_sibling()
-                        if next_elem and next_elem.name == "ul":
-                            for li in next_elem.find_all("li"):
-                                dep_text = li.get_text(strip=True)
-                                # Simple parsing
+            if dep_heading:
+                # Find the next sibling that contains the dependency list
+                dep_container = dep_heading.find_next_sibling("li", class_="pure-menu-item")
+                if dep_container:
+                    dep_submenu = dep_container.find("ul", class_="pure-menu-list")
+                    if dep_submenu:
+                        for dep_item in dep_submenu.find_all("li", class_="pure-menu-item"):
+                            link = dep_item.find("a")
+                            if link:
+                                # Parse dependency info
+                                dep_text = link.get_text(strip=True)
+                                # Look for dependency type indicator
+                                dep_type_elem = dep_item.find("i", class_="dependencies")
+                                dep_type = dep_type_elem.get_text(strip=True) if dep_type_elem else "normal"
+                                
+                                # Parse name and version from text like "arrow ^55.1.0"
                                 parts = dep_text.split()
-                                if parts:
-                                    dependencies.append({
-                                        "name": parts[0],
-                                        "version_req": parts[1] if len(parts) > 1 else "*",
-                                        "optional": False,
-                                        "features": []
-                                    })
-        
-        # Extract actual version from the page
-        actual_version = version
-        version_elem = soup.find("span", class_="version") or soup.find("div", class_="version")
-        if version_elem:
-            version_text = version_elem.get_text(strip=True)
-            # Extract version number
-            version_match = re.search(r'(\d+\.\d+\.\d+(?:-[\w.]+)?)', version_text)
-            if version_match:
-                actual_version = version_match.group(1)
+                                if len(parts) >= 2:
+                                    dep_name = parts[0]
+                                    dep_version = " ".join(parts[1:])
+                                    
+                                    dep_entry = {
+                                        "name": dep_name,
+                                        "version_req": dep_version,
+                                        "optional": dep_type == "optional"
+                                    }
+                                    
+                                    if link.get("href"):
+                                        dep_entry["url"] = f"https://docs.rs{link['href']}"
+                                    
+                                    if dep_type == "dev":
+                                        dev_dependencies.append(dep_entry)
+                                    elif dep_type == "build":
+                                        build_dependencies.append(dep_entry)
+                                    else:
+                                        dependencies.append(dep_entry)
         
         return {
             "crate": crate_name,
-            "version": actual_version,
-            "dependencies": dependencies,
-            "dev_dependencies": dev_dependencies,
-            "build_dependencies": build_dependencies,
-            "features": features,
-            "total_dependencies": len(dependencies) + len(dev_dependencies) + len(build_dependencies),
-            "page_url": final_url
+            "version": version,
+            "dependencies": {
+                "direct": dependencies,
+                "dev": dev_dependencies, 
+                "build": build_dependencies,
+                "features": features,
+                "total": len(dependencies) + len(dev_dependencies) + len(build_dependencies)
+            },
+            "debug_info": {
+                "sidebar_found": sidebar is not None,
+                "dependency_section_found": dep_heading is not None if sidebar else False,
+                "parsing_note": "Dependencies are extracted from the sidebar menu. If empty, the crate may have no dependencies or uses a different layout."
+            } if not dependencies and not dev_dependencies and not build_dependencies else None
         }
         
     except httpx.HTTPError as e:
@@ -1343,81 +1346,54 @@ async def get_module_hierarchy(
                 main_content = soup.find("div", class_="content") or soup.find("main")
                 
                 if main_content:
-                    # Find sections for different item types
-                    sections = main_content.find_all("section")
-                    
-                    for section in sections:
-                        section_id = section.get("id", "")
+                    # Find sections by looking for h2 headers with specific IDs
+                    for heading in main_content.find_all("h2", class_="section-header"):
+                        section_id = heading.get("id", "")
                         
-                        # Find items in this section
-                        item_list = section.find("ul") or section.find("div", class_="item-table")
+                        # Find the next sibling which should be the item list
+                        item_list = heading.find_next_sibling("dl", class_="item-table")
+                        if not item_list:
+                            item_list = heading.find_next_sibling("ul")
                         
                         if item_list:
                             items = []
-                            for item in item_list.find_all(["li", "div"], class_=lambda x: x and "item" in x):
-                                link = item.find("a")
-                                if link and link.get_text(strip=True):
-                                    items.append(link.get_text(strip=True))
+                            # For dl.item-table, look for dt elements
+                            if item_list.name == "dl":
+                                for dt in item_list.find_all("dt"):
+                                    link = dt.find("a")
+                                    if link and link.get_text(strip=True):
+                                        items.append(link.get_text(strip=True))
+                            else:
+                                # For ul, look for li elements
+                                for li in item_list.find_all("li"):
+                                    link = li.find("a")
+                                    if link and link.get_text(strip=True):
+                                        items.append(link.get_text(strip=True))
                             
                             # Categorize items by section ID
-                            if "structs" in section_id:
+                            if section_id == "modules":
+                                # Store modules separately for recursive exploration
+                                for item in items:
+                                    submodule_path = f"{module_path}/{item}"
+                                    if depth < max_depth:
+                                        submodule_info = await explore_module(submodule_path, depth + 1)
+                                        if submodule_info:
+                                            module_info["submodules"].append(submodule_info)
+                            elif section_id == "structs":
                                 module_info["items"]["structs"] = items
-                            elif "enums" in section_id:
+                            elif section_id == "enums":
                                 module_info["items"]["enums"] = items
-                            elif "traits" in section_id:
+                            elif section_id == "traits":
                                 module_info["items"]["traits"] = items
-                            elif "functions" in section_id:
+                            elif section_id == "functions":
                                 module_info["items"]["functions"] = items
-                            elif "types" in section_id or "type" in section_id:
+                            elif section_id in ["types", "type-aliases"]:
                                 module_info["items"]["types"] = items
-                            elif "macros" in section_id:
+                            elif section_id == "macros":
                                 module_info["items"]["macros"] = items
-                            elif "constants" in section_id or "consts" in section_id:
+                            elif section_id in ["constants", "consts"]:
                                 module_info["items"]["constants"] = items
                 
-                # Look for submodules
-                # Check sidebar for module listing
-                sidebar = soup.find("nav", class_="sidebar") or soup.find("div", class_="sidebar")
-                
-                if sidebar:
-                    # Look for modules section
-                    modules_section = None
-                    for heading in sidebar.find_all(["h2", "h3"]):
-                        if "modules" in heading.get_text(strip=True).lower():
-                            modules_section = heading.find_next_sibling()
-                            break
-                    
-                    if modules_section:
-                        for link in modules_section.find_all("a"):
-                            submodule_name = link.get_text(strip=True)
-                            if submodule_name and link.get("href"):
-                                # Build submodule path
-                                submodule_path = f"{module_path}/{submodule_name}"
-                                
-                                # Recursively explore submodule
-                                submodule_info = await explore_module(submodule_path, depth + 1)
-                                if submodule_info:
-                                    module_info["submodules"].append(submodule_info)
-                
-                # Alternative: Look for modules in main content
-                if not module_info["submodules"] and main_content:
-                    modules_heading = main_content.find(
-                        ["h2", "h3"], 
-                        id=lambda x: x and "modules" in x
-                    )
-                    
-                    if modules_heading:
-                        modules_list = modules_heading.find_next_sibling(["ul", "div"])
-                        if modules_list:
-                            for item in modules_list.find_all(["li", "a"]):
-                                link = item if item.name == "a" else item.find("a")
-                                if link and link.get_text(strip=True):
-                                    submodule_name = link.get_text(strip=True)
-                                    submodule_path = f"{module_path}/{submodule_name}"
-                                    
-                                    submodule_info = await explore_module(submodule_path, depth + 1)
-                                    if submodule_info:
-                                        module_info["submodules"].append(submodule_info)
                 
                 return module_info
                 
@@ -1549,39 +1525,47 @@ async def compare_versions(
                     main_content = soup.find("div", class_="content") or soup.find("main")
                     
                     if main_content:
-                        # Find all sections
-                        sections = main_content.find_all("section")
-                        
-                        for section in sections:
-                            section_id = section.get("id", "")
+                        # Find sections by looking for h2 headers with specific IDs
+                        for heading in main_content.find_all("h2", class_="section-header"):
+                            section_id = heading.get("id", "")
                             
-                            # Extract items from this section
-                            item_names = []
-                            item_list = section.find("ul") or section.find("div", class_="item-table")
+                            # Find the next sibling which should be the item list
+                            item_list = heading.find_next_sibling("dl", class_="item-table")
+                            if not item_list:
+                                item_list = heading.find_next_sibling("ul")
                             
                             if item_list:
-                                for item in item_list.find_all(["li", "div"], class_=lambda x: x and "item" in x):
-                                    link = item.find("a")
-                                    if link and link.get_text(strip=True):
-                                        item_names.append(link.get_text(strip=True))
-                            
-                            # Categorize by section
-                            if "modules" in section_id:
-                                items["modules"] = item_names
-                            elif "structs" in section_id:
-                                items["structs"] = item_names
-                            elif "enums" in section_id:
-                                items["enums"] = item_names
-                            elif "traits" in section_id:
-                                items["traits"] = item_names
-                            elif "functions" in section_id:
-                                items["functions"] = item_names
-                            elif "types" in section_id or "type" in section_id:
-                                items["types"] = item_names
-                            elif "macros" in section_id:
-                                items["macros"] = item_names
-                            elif "constants" in section_id or "consts" in section_id:
-                                items["constants"] = item_names
+                                item_names = []
+                                # For dl.item-table, look for dt elements
+                                if item_list.name == "dl":
+                                    for dt in item_list.find_all("dt"):
+                                        link = dt.find("a")
+                                        if link and link.get_text(strip=True):
+                                            item_names.append(link.get_text(strip=True))
+                                else:
+                                    # For ul, look for li elements
+                                    for li in item_list.find_all("li"):
+                                        link = li.find("a")
+                                        if link and link.get_text(strip=True):
+                                            item_names.append(link.get_text(strip=True))
+                                
+                                # Categorize by section ID
+                                if section_id == "modules":
+                                    items["modules"] = item_names
+                                elif section_id == "structs":
+                                    items["structs"] = item_names
+                                elif section_id == "enums":
+                                    items["enums"] = item_names
+                                elif section_id == "traits":
+                                    items["traits"] = item_names
+                                elif section_id == "functions":
+                                    items["functions"] = item_names
+                                elif section_id in ["types", "type-aliases"]:
+                                    items["types"] = item_names
+                                elif section_id == "macros":
+                                    items["macros"] = item_names
+                                elif section_id in ["constants", "consts"]:
+                                    items["constants"] = item_names
                                 
                 except Exception:
                     pass
