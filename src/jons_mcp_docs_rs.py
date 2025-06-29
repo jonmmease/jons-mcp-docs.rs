@@ -565,9 +565,12 @@ async def search_crates(
 ) -> dict[str, Any]:
     """Search for Rust crates by name.
 
+    Your starting point for discovering Rust crates! Search by name,
+    functionality, or domain keywords.
+
     Args:
         query: The search query for crate names
-        page: Page number (1-indexed) for pagination
+        page: Page number (1-indexed) for pagination (default: 1)
 
     Returns:
         A dictionary containing:
@@ -579,17 +582,31 @@ async def search_crates(
             - description: Brief description of the crate
             - date: Publication date (ISO format)
             - url: Direct URL to the crate's documentation
-        - total_on_page: Number of crates on this page
+        - total_on_page: Number of crates on this page (usually 30)
         - has_next_page: Boolean indicating if more pages are available
         - search_url: The actual search URL used
-        - error: Error message if something went wrong (optional)
 
-        Note: docs.rs uses token-based pagination internally, but this tool
-        abstracts it to simple page numbers. To get results from page 2+,
-        the tool will automatically fetch intermediate pages as needed.
-
-        The URLs in the crate results point directly to each crate's main
-        documentation page, which can then be explored using lookup_main_page.
+    Search tips:
+    - Exact names: "serde" → finds serde crate
+    - Partial names: "ser" → finds serde, serde_json, etc.
+    - Domain terms: "web", "async", "crypto", "parser"
+    - Combined: "async http" → async HTTP clients/servers
+    
+    What to do with results:
+    1. Pick a promising crate from results
+    2. Use lookup_main_page(crate_name) to explore it
+    3. Use get_module_hierarchy() to understand structure
+    4. Use analyze_dependencies() to check compatibility
+    
+    Popular search patterns:
+    - "json" → JSON parsing libraries
+    - "web server" → Web frameworks
+    - "async" → Async runtime and utilities
+    - "cli" → Command-line interface tools
+    - "test" → Testing frameworks
+    
+    Note: Results are sorted by relevance and popularity.
+    Newer or niche crates may appear on later pages.
     """
     try:
         # For page 1, use the simple search URL
@@ -702,26 +719,43 @@ async def get_source_code(
 ) -> dict[str, Any]:
     """Get the source code for a Rust item.
     
+    Essential companion to find_trait_implementors()! Use this to see
+    actual implementation code with line numbers.
+    
     Args:
-        page_key: Page key (same format as lookup_pages)
-        offset: Character offset for pagination
-        limit: Maximum number of characters to return
+        page_key: Page key from find_trait_implementors() or lookup_pages()
+        offset: Character offset for pagination (default: 0)
+        limit: Maximum number of characters to return (default: 50)
     
     Returns:
         A dictionary containing:
-        - key: The page key that was requested
-        - content: Source code content
+        - page_key: The page key that was requested
+        - source_code: Complete source code with line numbers
         - total_characters: Total length of the source code
         - offset: The starting position of this chunk
         - limit: Maximum characters requested
         - has_more: Boolean indicating if more content exists
         - total_lines: Total number of lines in the source
-        - language: Programming language (usually "rust")
-        - error: Error message if source not available (optional)
-        
-    Note: Source code must be available for the page (check source_available
-    in lookup_pages result). The source is returned as syntax-highlighted
-    code extracted from the HTML source viewer.
+        - language: Programming language (always "rust")
+        - url: Direct link to source on docs.rs
+    
+    Common workflow:
+    1. impls = find_trait_implementors("datafusion", "logical_expr/trait.ScalarUDFImpl")
+    2. impl = impls["implementors"][0]  # Pick one
+    3. source = get_source_code(impl["key"])  # View implementation!
+    
+    What to look for in source code:
+    - How required trait methods are implemented
+    - Error handling patterns
+    - Use of helper functions
+    - Performance optimizations
+    - Documentation and examples in comments
+    
+    Tips:
+    - Increase limit to see more code at once
+    - Look for #[cfg] attributes for conditional compilation
+    - Check imports to understand dependencies
+    - Compare simple vs complex implementations
     """
     try:
         # First, get the documentation page to find the source link
@@ -820,6 +854,10 @@ async def extract_code_examples(
 ) -> dict[str, Any]:
     """Extract code examples from documentation.
     
+    NOTE: Many popular crates (serde, tokio core, etc.) don't include inline
+    examples on docs.rs! This is NORMAL. When this returns empty, use
+    find_trait_implementors + get_source_code to see real usage patterns.
+    
     Args:
         crate_name: The name of the crate
         module_path: Optional module path to search within (e.g., "dataframe")
@@ -833,13 +871,22 @@ async def extract_code_examples(
             - code: The code example text
             - language: Language tag (usually "rust")
             - context: Surrounding text context (up to 200 chars)
-            - module: Module where the example was found
+            - source_page: Page where example was found
             - is_complete: Boolean indicating if it appears to be a complete example
-        - total_found: Total number of examples found
-        - filtered_count: Number after filtering (if filter applied)
-        
-    Complete examples are detected by looking for main() functions or
-    test functions. This is a heuristic and may not be perfect.
+        - total_examples: Total number of examples found
+        - debug_info: Explanation when no examples found (check this!)
+        - fallback_raw_examples: Raw code blocks if standard parsing fails
+    
+    Common patterns:
+    - serde: Examples on serde.rs (external site), not docs.rs
+    - tokio: Some modules have examples, others don't
+    - std: Rich with examples
+    - Small utility crates: Often no examples
+    
+    When empty, try this workflow instead:
+    1. find_trait_implementors() to find real implementations
+    2. get_source_code() to see how they implement methods
+    3. This often provides better learning than documentation examples!
     """
     try:
         # Determine which page to fetch
@@ -1038,6 +1085,9 @@ async def find_trait_implementors(
 ) -> dict[str, Any]:
     """Find all types that implement a specific trait.
     
+    This is one of the MOST VALUABLE tools for learning Rust patterns!
+    Use this to see real-world implementations of any trait.
+    
     Args:
         crate_name: The name of the crate containing the trait
         trait_path: Path to the trait (e.g., "logical_expr/trait.ScalarUDFImpl")
@@ -1046,20 +1096,32 @@ async def find_trait_implementors(
     Returns:
         A dictionary containing:
         - crate: The crate name
+        - version: The crate version
         - trait_path: The trait path
-        - trait_name: The trait name extracted from the path
+        - trait_url: Direct URL to the trait documentation
         - implementors: List of implementors, each containing:
-            - type_name: Name of the implementing type
-            - key: Navigation key for the type's documentation
-            - in_crate: Boolean indicating if it's in the same crate
+            - name: Name of the implementing type
+            - key: Navigation key for get_source_code() - USE THIS!
             - module: Module containing the type
-        - foreign_implementors: Count of implementors from other crates
-        - total_implementors: Total count
-        - error: Error message if trait not found (optional)
-        
-    Note: This extracts information from the "Implementors" section of trait
-    documentation pages. Foreign implementors (from other crates) may have
-    limited information available.
+        - total_implementors: Total count (direct + blanket)
+        - direct_implementors: Count of direct implementations
+        - blanket_implementors: Count of blanket implementations
+        - debug_info: Explanation if no implementors found
+        - fallback_impl_mentions: Text mentions of implementations if parsing fails
+    
+    Common usage pattern:
+    1. Find trait implementors: impls = find_trait_implementors(...)
+    2. Pick an interesting implementor: impl = impls["implementors"][0]
+    3. View its source: source = get_source_code(impl["key"])
+    4. Study how required methods are implemented
+    
+    Examples that work well:
+    - find_trait_implementors("datafusion", "logical_expr/trait.ScalarUDFImpl")
+      → 121 implementations showing different function patterns
+    - find_trait_implementors("tokio", "io/trait.AsyncRead")
+      → See how async I/O is implemented
+    - find_trait_implementors("serde", "ser/trait.Serialize")
+      → Learn serialization patterns
     """
     try:
         # Construct the trait page key
@@ -1178,6 +1240,9 @@ async def analyze_dependencies(
 ) -> dict[str, Any]:
     """Get crate dependencies and feature flags.
     
+    Understand what a crate is built on and what features it offers.
+    Essential for evaluating if a crate fits your project's needs.
+    
     Args:
         crate_name: The name of the crate to analyze
         version: Version of the crate (defaults to "latest")
@@ -1186,21 +1251,34 @@ async def analyze_dependencies(
         A dictionary containing:
         - crate: The crate name
         - version: The crate version
-        - dependencies: List of runtime dependencies, each containing:
+        - dependencies: Object with:
+            - direct: Runtime dependencies needed by the crate
+            - dev: Dependencies only for testing/examples
+            - build: Dependencies only for build scripts
+            - total: Total count across all categories
+        Each dependency has:
             - name: Dependency crate name
-            - version_req: Version requirement string
-            - optional: Boolean indicating if it's optional
-            - features: List of features enabled for this dependency
-        - dev_dependencies: List of development dependencies (same format)
-        - build_dependencies: List of build dependencies (same format)
-        - features: Dictionary of feature flags, each containing:
-            - default: List of crates/features enabled by default
-            - [feature_name]: List of crates/features enabled by this feature
-        - total_dependencies: Total count across all categories
-        - error: Error message if analysis fails (optional)
+            - version_req: Version requirement (e.g., "^1.0", ">=0.5")
+            - optional: True if behind a feature flag
+            - url: Link to the dependency's docs
         
-    Note: This information is extracted from the crate's main documentation
-    page sidebar, which shows dependencies and features from Cargo.toml.
+    Understanding dependencies:
+    - direct: What you'll pull in when using this crate
+    - optional: Enable with feature flags to access functionality
+    - version_req: "^1.0" means >=1.0.0, <2.0.0 (semver)
+    - dev: Not included in your build, only for crate development
+    
+    Common patterns:
+    - async crates depend on tokio or async-std
+    - serialization crates depend on serde
+    - web frameworks depend on hyper or actix
+    - optional deps often add integrations
+    
+    Example insights:
+    - Many deps = mature ecosystem integration
+    - Few deps = lightweight, fewer conflicts
+    - Optional deps = flexible, pay-for-what-you-use
+    - Check if deps match your existing stack
     """
     try:
         # Fetch the crate's main page HTML
@@ -1315,6 +1393,9 @@ async def get_module_hierarchy(
 ) -> dict[str, Any]:
     """Get the module structure and hierarchy of a crate.
     
+    Perfect for understanding how a crate is organized before diving deep.
+    Use this as your starting point when exploring a new crate.
+    
     Args:
         crate_name: The name of the crate
         start_module: Optional starting module path (defaults to root)
@@ -1329,7 +1410,7 @@ async def get_module_hierarchy(
         - modules: Hierarchical module structure, each module containing:
             - name: Module name
             - path: Full module path
-            - key: Navigation key for the module
+            - key: Navigation key for use with lookup_pages()
             - submodules: List of child modules (recursive)
             - items: Dictionary of items in the module:
                 - structs: List of struct names
@@ -1337,12 +1418,28 @@ async def get_module_hierarchy(
                 - traits: List of trait names
                 - functions: List of function names
                 - types: List of type alias names
+                - macros: List of macro names
+                - constants: List of constant names
         - total_modules: Total count of modules found
-        - error: Error message if analysis fails (optional)
-        
-    Note: This extracts the module structure from the navigation sidebar
-    and module documentation pages. Deep hierarchies may require multiple
-    requests.
+        - max_depth: The maximum depth used
+    
+    Usage patterns:
+    1. Explore entire crate: get_module_hierarchy("tokio")
+    2. Focus on specific module: get_module_hierarchy("tokio", "io", max_depth=4)
+    3. Use keys to navigate: lookup_pages([module["key"]])
+    
+    Tips for exploration:
+    - Start with max_depth=2 for overview, increase for details
+    - Look for modules named after your use case
+    - Traits often define the main interfaces
+    - 'prelude' modules show the most commonly used items
+    - 'examples' or 'tests' modules may contain usage patterns
+    
+    Example workflow:
+    hierarchy = get_module_hierarchy("datafusion")
+    # Find modules with "expr" in the name - likely expression handling
+    # Find traits in logical_expr module - core abstractions
+    # Navigate to specific items using their keys
     """
     try:
         # Construct starting page
