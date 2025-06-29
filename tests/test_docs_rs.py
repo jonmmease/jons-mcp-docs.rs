@@ -12,6 +12,7 @@ from src.jons_mcp_docs_rs import (
     paginate_content,
     search_crates,
     search_docs,
+    transform_markdown_links,
 )
 
 
@@ -62,6 +63,40 @@ class TestUtilityFunctions:
         paginated, total = paginate_content(content, 100, 10)
         assert paginated == ""
         assert total == len(content)
+
+    def test_transform_markdown_links(self):
+        """Test markdown link transformation."""
+        # Test docs.rs absolute URL
+        content = "[ScalarUDF](https://docs.rs/datafusion/latest/datafusion/logical_expr/struct.ScalarUDF.html)"
+        base_url = "https://docs.rs/datafusion/latest/datafusion/index.html"
+        result = transform_markdown_links(content, base_url)
+        assert (
+            result
+            == "[ScalarUDF](docs.rs://datafusion/latest/datafusion/logical_expr/struct.ScalarUDF)"
+        )
+
+        # Test relative URL
+        content = "[DataFusionError](../error/enum.DataFusionError.html)"
+        base_url = "https://docs.rs/datafusion/latest/datafusion/logical_expr/trait.ScalarUDFImpl.html"
+        result = transform_markdown_links(content, base_url)
+        assert (
+            result
+            == "[DataFusionError](docs.rs://datafusion/latest/datafusion/error/enum.DataFusionError)"
+        )
+
+        # Test rust-lang.org URL
+        content = "[String](https://doc.rust-lang.org/nightly/alloc/string/struct.String.html)"
+        base_url = "https://docs.rs/datafusion/latest/datafusion/index.html"
+        result = transform_markdown_links(content, base_url)
+        assert (
+            result == "[String](docs.rs://rust-lang/nightly/alloc/string/struct.String)"
+        )
+
+        # Test already transformed link (should not change)
+        content = "[Test](docs.rs://some/path)"
+        base_url = "https://docs.rs/test/latest/test/index.html"
+        result = transform_markdown_links(content, base_url)
+        assert result == content
 
 
 @pytest.mark.asyncio

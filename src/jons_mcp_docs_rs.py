@@ -68,6 +68,107 @@ def convert_url_to_key(url: str) -> str:
     return path
 
 
+def transform_markdown_links(markdown_content: str, base_url: str) -> str:
+    """Transform markdown links to use docs.rs:// protocol.
+
+    This function:
+    1. Converts docs.rs URLs to docs.rs:// protocol
+    2. Resolves relative URLs based on the base URL
+    3. Converts doc.rust-lang.org URLs to docs.rs://rust-lang/ format
+    """
+    # Parse base URL to get the current page context
+    parsed_base = urlparse(base_url)
+
+    # Regular expression to find markdown links
+    link_pattern = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+
+    def transform_link(match):
+        link_text = match.group(1)
+        link_url = match.group(2)
+
+        # Skip if already using docs.rs:// protocol
+        if link_url.startswith("docs.rs://"):
+            return match.group(0)
+
+        # Parse the URL
+        parsed = urlparse(link_url)
+
+        # Handle absolute URLs
+        if parsed.netloc:
+            if parsed.netloc == "docs.rs":
+                # Convert docs.rs URLs to docs.rs:// protocol
+                path = parsed.path.strip("/")
+                if path.endswith(".html"):
+                    path = path[:-5]
+                return f"[{link_text}](docs.rs://{path})"
+            elif parsed.netloc == "doc.rust-lang.org":
+                # Convert rust-lang.org URLs to docs.rs://rust-lang/ format
+                path = parsed.path.strip("/")
+                if path.endswith(".html"):
+                    path = path[:-5]
+                # Replace 'stable' or 'nightly' with the version
+                # e.g., /nightly/alloc/string/struct.String -> rust-lang/nightly/alloc/string/struct.String
+                return f"[{link_text}](docs.rs://rust-lang/{path})"
+            else:
+                # Keep other absolute URLs as-is
+                return match.group(0)
+
+        # Handle relative URLs
+        else:
+            # Resolve relative URL based on the base URL
+            if parsed_base.netloc == "docs.rs":
+                # Get the base path without the file name
+                base_path = parsed_base.path.strip("/")
+                if base_path.endswith(".html"):
+                    # Remove the file part to get the directory
+                    base_parts = base_path.split("/")
+                    base_parts = base_parts[:-1]  # Remove file
+                    base_path = "/".join(base_parts)
+
+                # Resolve the relative path
+                if link_url.startswith("../"):
+                    # Go up directories
+                    parts = base_path.split("/")
+                    relative_parts = link_url.split("/")
+
+                    # Count how many directories to go up
+                    up_count = 0
+                    for part in relative_parts:
+                        if part == "..":
+                            up_count += 1
+                        else:
+                            break
+
+                    # Remove directories from base path
+                    if up_count > 0 and len(parts) >= up_count:
+                        parts = parts[:-up_count]
+
+                    # Add the remaining relative path
+                    remaining = "/".join(relative_parts[up_count:])
+                    if remaining:
+                        parts.append(remaining)
+
+                    resolved_path = "/".join(parts)
+                elif not link_url.startswith("/"):
+                    # Relative to current directory
+                    resolved_path = f"{base_path}/{link_url}"
+                else:
+                    # Absolute path on the same domain
+                    resolved_path = link_url.strip("/")
+
+                # Remove .html extension
+                if resolved_path.endswith(".html"):
+                    resolved_path = resolved_path[:-5]
+
+                return f"[{link_text}](docs.rs://{resolved_path})"
+            else:
+                # For non-docs.rs base URLs, keep relative URLs as-is
+                return match.group(0)
+
+    # Transform all links in the content
+    return link_pattern.sub(transform_link, markdown_content)
+
+
 def extract_links_as_keys(html_content: str, base_url: str) -> list[dict[str, str]]:
     """Extract links from HTML and convert them to keys."""
     soup = BeautifulSoup(html_content, "html.parser")
@@ -133,7 +234,7 @@ async def lookup_main_page(
         A dictionary containing:
         - crate: The crate name
         - version: The version being viewed
-        - content: The documentation content as markdown
+        - content: The documentation content as markdown with transformed links
         - total_characters: Total length of the full content
         - offset: The starting position of this chunk
         - limit: Maximum characters requested
@@ -149,6 +250,14 @@ async def lookup_main_page(
         to navigate to those specific documentation pages. For example, if a link
         has key "tokio/latest/tokio/runtime/struct.Runtime", you can pass this
         exact string to lookup_pages to view that struct's documentation.
+
+        Links in the markdown content are transformed to use the docs.rs:// protocol:
+        - docs.rs links: [text](docs.rs://crate/version/path)
+        - rust-lang.org links: [text](docs.rs://rust-lang/version/path)
+        - Relative links are resolved to absolute docs.rs:// links
+
+        This allows easy navigation by extracting the path from docs.rs:// links
+        and using it with the lookup_pages tool.
     """
     try:
         version = version or DEFAULT_VERSION
@@ -162,6 +271,9 @@ async def lookup_main_page(
 
         # Convert HTML to markdown
         markdown_content = h2t.handle(html_content)
+
+        # Transform links to use docs.rs:// protocol
+        markdown_content = transform_markdown_links(markdown_content, final_url)
 
         # Paginate the content
         paginated_content, total_chars = paginate_content(
@@ -205,7 +317,9 @@ async def lookup_pages(
     """Look up one or more specific documentation pages.
 
     Args:
-        pages: List of page keys (e.g., ["datafusion/latest/datafusion/dataframe/struct.DataFrame"])
+        pages: List of page keys or docs.rs:// URLs
+               (e.g., ["datafusion/latest/datafusion/dataframe/struct.DataFrame"] or
+                ["docs.rs://tokio/latest/tokio/runtime/struct.Runtime"])
         version: Override version for all pages (optional)
         offset: Character offset for combined pagination
         limit: Maximum number of characters to return across all pages
@@ -218,7 +332,7 @@ async def lookup_pages(
             - content_length: Total length of this page's content
             - links_count: Number of links found on this page
             - error: Error message if the page failed to load (optional)
-        - content: Combined markdown content from all pages
+        - content: Combined markdown content from all pages with transformed links
         - total_characters: Total length of all combined content
         - offset: The starting position of this chunk
         - limit: Maximum characters requested
@@ -229,9 +343,17 @@ async def lookup_pages(
         1. The 'key' field in links returned by lookup_main_page
         2. The 'key' field in search results from search_docs
         3. Manually constructed using the pattern: "crate/version/path/to/item"
+        4. Extracted from docs.rs:// links in markdown content
+        5. Using "rust-lang/version/path" for Rust standard library docs
+
+        Special handling:
+        - Keys starting with "rust-lang/" fetch from doc.rust-lang.org
+        - Keys can include the "docs.rs://" prefix (it will be stripped)
+        - All links in returned content use the docs.rs:// protocol
 
         Example: To view DataFrame documentation after finding it in search results,
         pass its key "datafusion/latest/datafusion/dataframe/struct.DataFrame"
+        or "docs.rs://datafusion/latest/datafusion/dataframe/struct.DataFrame"
         to this tool.
     """
     results = []
@@ -242,21 +364,35 @@ async def lookup_pages(
             # Normalize the page key
             page_key = normalize_crate_path(page_key)
 
-            # If version override is provided, replace the version in the key
-            if version and "/" in page_key:
-                parts = page_key.split("/")
-                if len(parts) >= 2:
-                    parts[1] = version
-                    page_key = "/".join(parts)
+            # Handle docs.rs:// protocol
+            if page_key.startswith("docs.rs://"):
+                page_key = page_key[10:]  # Remove "docs.rs://" prefix
 
-            # Construct the URL
-            url = f"{BASE_URL}/{page_key}.html"
+            # Check if this is a rust-lang documentation request
+            if page_key.startswith("rust-lang/"):
+                # Extract the path after rust-lang/
+                rust_path = page_key[10:]  # Remove "rust-lang/"
+                # Construct URL for doc.rust-lang.org
+                url = f"https://doc.rust-lang.org/{rust_path}.html"
+            else:
+                # If version override is provided, replace the version in the key
+                if version and "/" in page_key:
+                    parts = page_key.split("/")
+                    if len(parts) >= 2:
+                        parts[1] = version
+                        page_key = "/".join(parts)
+
+                # Construct the URL for docs.rs
+                url = f"{BASE_URL}/{page_key}.html"
 
             # Fetch the page
             html_content, final_url = await fetch_page(url)
 
             # Convert HTML to markdown
             markdown_content = h2t.handle(html_content)
+
+            # Transform links to use docs.rs:// protocol
+            markdown_content = transform_markdown_links(markdown_content, final_url)
 
             # Extract links for this page
             links = extract_links_as_keys(html_content, final_url)
