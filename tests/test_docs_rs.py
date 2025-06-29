@@ -10,6 +10,7 @@ from src.jons_mcp_docs_rs import (
     lookup_pages,
     normalize_crate_path,
     paginate_content,
+    search_crates,
     search_docs,
 )
 
@@ -124,3 +125,27 @@ class TestTools:
             assert "limit" in result
             assert "has_more" in result
             assert "search_url" in result
+
+    async def test_search_crates_structure(self):
+        """Test that search_crates returns the expected structure."""
+        result = await search_crates("test-crate", page=1)
+
+        assert "query" in result
+        assert "page" in result
+
+        if "error" in result:
+            assert isinstance(result["error"], str)
+        else:
+            assert "crates" in result
+            assert "total_on_page" in result
+            assert "has_next_page" in result
+            assert "search_url" in result
+
+            # If there are crates, check their structure
+            if result["crates"]:
+                crate = result["crates"][0]
+                assert "name" in crate
+                assert "version" in crate
+                assert "description" in crate
+                assert "date" in crate
+                assert "url" in crate

@@ -346,6 +346,123 @@ async def search_docs(
         }
 
 
+@mcp.tool()
+async def search_crates(
+    query: str,
+    page: int = 1,
+) -> dict[str, Any]:
+    """Search for Rust crates by name.
+
+    Args:
+        query: The search query for crate names
+        page: Page number (1-indexed) for pagination
+
+    Returns:
+        A dictionary containing crate search results with pagination info
+    """
+    try:
+        # For page 1, use the simple search URL
+        if page == 1:
+            search_url = f"{BASE_URL}/releases/search?query={quote(query)}"
+        else:
+            # For subsequent pages, we need to fetch pages sequentially
+            # because pagination uses tokens, not page numbers
+            current_url = f"{BASE_URL}/releases/search?query={quote(query)}"
+
+            for i in range(1, page):
+                # Fetch the current page
+                html_content, _ = await fetch_page(current_url)
+                soup = BeautifulSoup(html_content, "html.parser")
+
+                # Find the next page link
+                next_link = None
+                pagination_div = soup.find("div", class_="pagination")
+                if pagination_div:
+                    for link in pagination_div.find_all("a"):
+                        if "Next" in link.get_text(strip=True) and link.get("href"):
+                            next_link = link
+                            break
+
+                if not next_link:
+                    # No more pages available
+                    return {
+                        "query": query,
+                        "page": page,
+                        "crates": [],
+                        "has_next_page": False,
+                        "error": f"Page {page} not found (max page reached: {i})",
+                    }
+
+                # Update URL for next iteration
+                current_url = urljoin(BASE_URL, next_link["href"])
+
+            search_url = current_url
+
+        # Fetch the requested page
+        html_content, final_url = await fetch_page(search_url)
+        soup = BeautifulSoup(html_content, "html.parser")
+
+        # Parse crate results
+        crates = []
+        release_links = soup.find_all("a", class_="release")
+
+        for link in release_links:
+            name_div = link.find("div", class_="name")
+            desc_div = link.find("div", class_="description")
+            date_div = link.find("div", class_="date")
+
+            if name_div:
+                # Parse crate name and version from "crate-name-version" format
+                full_name = name_div.get_text(strip=True)
+                # Find the last hyphen followed by a version number
+                match = re.match(r"^(.+)-(\d+\.\d+\.\d+(?:-[\w\.]+)?)$", full_name)
+                if match:
+                    crate_name = match.group(1)
+                    version = match.group(2)
+                else:
+                    # Fallback: treat the whole thing as the name
+                    crate_name = full_name
+                    version = "unknown"
+
+                crate_info = {
+                    "name": crate_name,
+                    "version": version,
+                    "description": desc_div.get_text(strip=True) if desc_div else "",
+                    "date": date_div.get("title", "") if date_div else "",
+                    "url": urljoin(BASE_URL, link["href"]) if link.get("href") else "",
+                }
+                crates.append(crate_info)
+
+        # Check if there's a next page
+        # Look in pagination div for more reliable detection
+        pagination_div = soup.find("div", class_="pagination")
+        has_next_page = False
+        if pagination_div:
+            for link in pagination_div.find_all("a"):
+                link_text = link.get_text(strip=True)
+                if "Next" in link_text and link.get("href"):
+                    has_next_page = True
+                    break
+
+        return {
+            "query": query,
+            "page": page,
+            "crates": crates,
+            "total_on_page": len(crates),
+            "has_next_page": has_next_page,
+            "search_url": final_url,
+        }
+
+    except httpx.HTTPError as e:
+        return {
+            "error": f"Failed to search crates: {str(e)}",
+            "query": query,
+            "page": page,
+        }
+    except Exception as e:
+        return {"error": f"Unexpected error: {str(e)}", "query": query, "page": page}
+
+
 def cleanup():
     """Cleanup function to be called on exit."""
     logger.info("Rust docs MCP server shutting down gracefully")

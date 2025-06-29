@@ -9,6 +9,7 @@ This MCP server enables AI assistants to browse and search Rust crate documentat
 - Fetching main documentation pages with pagination
 - Looking up specific documentation pages (structs, traits, modules, etc.)
 - Searching within crate documentation
+- Searching for crates by name with pagination
 - Converting docs.rs URLs to navigation keys for seamless browsing
 
 ## Features
@@ -16,6 +17,7 @@ This MCP server enables AI assistants to browse and search Rust crate documentat
 - **Main Page Lookup**: Fetch the main documentation page for any Rust crate with configurable version
 - **Multi-Page Lookup**: Fetch multiple documentation pages in a single request with combined pagination
 - **Search Functionality**: Search within a crate's documentation and get paginated results
+- **Crate Search**: Search for crates by name across the entire docs.rs catalog
 - **Smart Pagination**: Character-based pagination for handling large documentation
 - **Link Extraction**: Automatically extract and convert links to navigation keys
 - **Version Control**: Support for specific crate versions or default to latest
@@ -190,6 +192,42 @@ Search within a crate's documentation.
   "limit": 10,
   "has_more": true,
   "search_url": "https://docs.rs/datafusion/latest/datafusion/?search=udf"
+}
+```
+
+### search_crates
+
+Search for Rust crates by name on docs.rs.
+
+**Parameters:**
+- `query` (required): The search query for crate names
+- `page` (optional): Page number (1-indexed) for pagination (default: 1)
+
+**Example:**
+```json
+{
+  "query": "serde",
+  "page": 1
+}
+```
+
+**Response:**
+```json
+{
+  "query": "serde",
+  "page": 1,
+  "crates": [
+    {
+      "name": "serde",
+      "version": "1.0.219",
+      "description": "A generic serialization/deserialization framework",
+      "date": "2025-06-17T02:58:14Z",
+      "url": "https://docs.rs/serde/latest/serde/"
+    }
+  ],
+  "total_on_page": 30,
+  "has_next_page": true,
+  "search_url": "https://docs.rs/releases/search?query=serde"
 }
 ```
 
