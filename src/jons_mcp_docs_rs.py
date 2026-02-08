@@ -2,14 +2,21 @@
 """
 FastMCP server that provides tools for looking up Rust documentation from docs.rs.
 """
+import argparse
 import atexit
 import logging
 import os
 import re
 import signal
 import sys
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urljoin, urlparse
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
 
 import html2text
 import httpx
@@ -38,6 +45,37 @@ h2t.ignore_links = False
 h2t.body_width = 0  # Don't wrap lines
 h2t.skip_internal_links = False
 h2t.single_line_break = True
+
+# Cargo.lock version mapping (populated at startup if --project-dir is provided)
+_cargo_lock_versions: dict[str, str] = {}
+
+
+def parse_cargo_lock(cargo_lock_path: Path) -> dict[str, str]:
+    """Parse a Cargo.lock file and return a crate name -> version mapping."""
+    with open(cargo_lock_path, "rb") as f:
+        data = tomllib.load(f)
+    return {
+        pkg["name"]: pkg["version"]
+        for pkg in data.get("package", [])
+        if "name" in pkg and "version" in pkg
+    }
+
+
+def resolve_version(
+    crate_name: str, explicit_version: str | None
+) -> tuple[str, str]:
+    """Resolve the version for a crate lookup.
+
+    Returns (version, version_source) where version_source is one of:
+    - "explicit": caller provided a version parameter
+    - "cargo_lock": version resolved from Cargo.lock
+    - "default": fell back to DEFAULT_VERSION ("latest")
+    """
+    if explicit_version is not None:
+        return explicit_version, "explicit"
+    if crate_name in _cargo_lock_versions:
+        return _cargo_lock_versions[crate_name], "cargo_lock"
+    return DEFAULT_VERSION, "default"
 
 
 def normalize_crate_path(path: str) -> str:
@@ -240,7 +278,7 @@ async def lookup_main_page(
 
     Args:
         crate_name: The name of the crate (e.g., "datafusion")
-        version: The version to look up (defaults to "latest")
+        version: The version to look up. Resolution priority: explicit > Cargo.lock > "latest"
         offset: Character offset for pagination
         limit: Maximum number of characters to return
 
@@ -274,7 +312,7 @@ async def lookup_main_page(
         and using it with the lookup_pages tool.
     """
     try:
-        version = version or DEFAULT_VERSION
+        version, version_source = resolve_version(crate_name, version)
         url = f"{BASE_URL}/{crate_name}/{version}/"
 
         # Fetch the page
@@ -297,6 +335,7 @@ async def lookup_main_page(
         return {
             "crate": crate_name,
             "version": version,
+            "version_source": version_source,
             "content": paginated_content,
             "total_characters": total_chars,
             "offset": offset,
@@ -461,7 +500,7 @@ async def search_docs(
     Args:
         crate_name: The name of the crate to search in
         query: The search query
-        version: The version to search (defaults to "latest")
+        version: The version to search. Resolution priority: explicit > Cargo.lock > "latest"
         offset: Result offset for pagination
         limit: Maximum number of results to return
 
@@ -486,7 +525,7 @@ async def search_docs(
         from search results directly to the relevant documentation pages.
     """
     try:
-        version = version or DEFAULT_VERSION
+        version, version_source = resolve_version(crate_name, version)
         # Construct search URL
         search_url = (
             f"{BASE_URL}/{crate_name}/{version}/{crate_name}/?search={quote(query)}"
@@ -533,6 +572,7 @@ async def search_docs(
         return {
             "crate": crate_name,
             "version": version,
+            "version_source": version_source,
             "query": query,
             "results": paginated_results,
             "total_results": total_results,
@@ -851,6 +891,7 @@ async def extract_code_examples(
     module_path: str | None = None,
     filter_text: str | None = None,
     only_complete: bool = False,
+    version: str | None = None,
 ) -> dict[str, Any]:
     """Extract code examples from documentation.
     
@@ -863,6 +904,7 @@ async def extract_code_examples(
         module_path: Optional module path to search within (e.g., "dataframe")
         filter_text: Optional text to filter examples (case-insensitive)
         only_complete: If True, only return examples that appear to be complete programs
+        version: Version of the crate. Resolution priority: explicit > Cargo.lock > "latest"
     
     Returns:
         A dictionary containing:
@@ -889,11 +931,12 @@ async def extract_code_examples(
     3. This often provides better learning than documentation examples!
     """
     try:
+        version, version_source = resolve_version(crate_name, version)
         # Determine which page to fetch
         if module_path:
-            page_key = f"{crate_name}/latest/{crate_name}/{module_path}"
+            page_key = f"{crate_name}/{version}/{crate_name}/{module_path}"
         else:
-            page_key = f"{crate_name}/latest/{crate_name}"
+            page_key = f"{crate_name}/{version}/{crate_name}"
         
         # Fetch the documentation page HTML directly
         url = f"{BASE_URL}/{page_key}/index.html"
@@ -1057,7 +1100,8 @@ async def extract_code_examples(
         # Limit results
         return {
             "crate": crate_name,
-            "version": "latest",
+            "version": version,
+            "version_source": version_source,
             "search_pattern": filter_text,
             "examples": examples[:50],  # Limit to 50 examples
             "total_found": len(examples),
@@ -1081,7 +1125,7 @@ async def extract_code_examples(
 async def find_trait_implementors(
     crate_name: str,
     trait_path: str,
-    version: str = "latest",
+    version: str | None = None,
 ) -> dict[str, Any]:
     """Find all types that implement a specific trait.
     
@@ -1091,7 +1135,7 @@ async def find_trait_implementors(
     Args:
         crate_name: The name of the crate containing the trait
         trait_path: Path to the trait (e.g., "logical_expr/trait.ScalarUDFImpl")
-        version: Version of the crate (defaults to "latest")
+        version: Version of the crate. Resolution priority: explicit > Cargo.lock > "latest"
     
     Returns:
         A dictionary containing:
@@ -1124,9 +1168,10 @@ async def find_trait_implementors(
       → Learn serialization patterns
     """
     try:
+        version, version_source = resolve_version(crate_name, version)
         # Construct the trait page key
         page_key = f"{crate_name}/{version}/{crate_name}/{trait_path}"
-        
+
         # Fetch the trait documentation page HTML directly
         url = f"{BASE_URL}/{page_key}.html"
         html_content, final_url = await fetch_page(url)
@@ -1205,6 +1250,7 @@ async def find_trait_implementors(
         return {
             "crate": crate_name,
             "version": version,
+            "version_source": version_source,
             "trait_path": trait_path,
             "trait_url": final_url,
             "implementors": implementors,
@@ -1236,7 +1282,7 @@ async def find_trait_implementors(
 @mcp.tool()
 async def analyze_dependencies(
     crate_name: str,
-    version: str = "latest",
+    version: str | None = None,
 ) -> dict[str, Any]:
     """Get crate dependencies and feature flags.
     
@@ -1245,7 +1291,7 @@ async def analyze_dependencies(
     
     Args:
         crate_name: The name of the crate to analyze
-        version: Version of the crate (defaults to "latest")
+        version: Version of the crate. Resolution priority: explicit > Cargo.lock > "latest"
     
     Returns:
         A dictionary containing:
@@ -1281,6 +1327,7 @@ async def analyze_dependencies(
     - Check if deps match your existing stack
     """
     try:
+        version, version_source = resolve_version(crate_name, version)
         # Fetch the crate's main page HTML
         url = f"{BASE_URL}/{crate_name}/{version}/"
         html_content, final_url = await fetch_page(url)
@@ -1357,6 +1404,7 @@ async def analyze_dependencies(
         return {
             "crate": crate_name,
             "version": version,
+            "version_source": version_source,
             "dependencies": {
                 "direct": dependencies,
                 "dev": dev_dependencies, 
@@ -1389,7 +1437,7 @@ async def get_module_hierarchy(
     crate_name: str,
     start_module: str | None = None,
     max_depth: int = 3,
-    version: str = "latest",
+    version: str | None = None,
 ) -> dict[str, Any]:
     """Get the module structure and hierarchy of a crate.
     
@@ -1400,7 +1448,7 @@ async def get_module_hierarchy(
         crate_name: The name of the crate
         start_module: Optional starting module path (defaults to root)
         max_depth: Maximum depth to traverse (default 3)
-        version: Version of the crate (defaults to "latest")
+        version: Version of the crate. Resolution priority: explicit > Cargo.lock > "latest"
     
     Returns:
         A dictionary containing:
@@ -1442,6 +1490,7 @@ async def get_module_hierarchy(
     # Navigate to specific items using their keys
     """
     try:
+        version, version_source = resolve_version(crate_name, version)
         # Construct starting page
         if start_module:
             page_key = f"{crate_name}/{version}/{crate_name}/{start_module}"
@@ -1560,10 +1609,11 @@ async def get_module_hierarchy(
         return {
             "crate": crate_name,
             "version": version,
+            "version_source": version_source,
             "start_module": start_module or "root",
             "modules": root_module,
             "total_modules": total_modules,
-            "max_depth": max_depth
+            "max_depth": max_depth,
         }
         
     except httpx.HTTPError as e:
@@ -1837,6 +1887,34 @@ atexit.register(cleanup)
 
 def main():
     """Initialize and run the FastMCP server."""
+    global _cargo_lock_versions
+
+    # Parse CLI arguments
+    parser = argparse.ArgumentParser(
+        prog="jons-mcp-docs-rs",
+        description="MCP server for Rust documentation from docs.rs",
+    )
+    parser.add_argument(
+        "--project-dir",
+        type=str,
+        default=None,
+        help="Path to project directory containing Cargo.lock",
+    )
+    args = parser.parse_args()
+
+    # Load Cargo.lock if project-dir is provided
+    if args.project_dir:
+        cargo_lock_path = Path(args.project_dir) / "Cargo.lock"
+        if cargo_lock_path.exists():
+            _cargo_lock_versions = parse_cargo_lock(cargo_lock_path)
+            logger.info(
+                f"Loaded {len(_cargo_lock_versions)} crate versions from {cargo_lock_path}"
+            )
+        else:
+            print(
+                f"Warning: Cargo.lock not found at {cargo_lock_path}",
+                file=sys.stderr,
+            )
 
     # Handle signals gracefully
     def signal_handler(sig, frame):
