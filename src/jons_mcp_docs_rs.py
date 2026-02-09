@@ -21,7 +21,9 @@ import io
 import logging
 import os
 import re
+import shutil
 import signal
+import subprocess
 import sys
 import tarfile
 import time
@@ -30,7 +32,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
 from typing import Any
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urljoin, urlparse
 
 try:
     import tomllib
@@ -61,6 +63,39 @@ MAX_HTTP_RETRIES = 1
 LOOKUP_CONCURRENCY = 8
 CACHE_TTL_SECONDS = 300
 CACHE_MAX_ENTRIES = 256
+RELEASE_NOTES_MAX_RELEASE_SCAN = 100
+RELEASE_NOTES_MAX_RELEASE_PAGES = 10
+RELEASE_NOTES_MAX_ITEMS = 100
+RELEASE_NOTES_HTTP_TIMEOUT_SECONDS = 20.0
+RELEASE_NOTES_RESEARCH_CONCURRENCY = 4
+RELEASE_NOTES_RESEARCH_RATE_LIMIT_THRESHOLD = 6
+RELEASE_NOTES_GUIDE_PATHS = [
+    "/upgrading",
+    "/upgrading/",
+    "/upgrade-guide",
+    "/migration-guide",
+    "/migrations",
+    "/release-notes",
+    "/changelog",
+]
+RELEASE_NOTES_CHANGELOG_PATHS = [
+    "CHANGELOG.md",
+    "CHANGELOG",
+    "CHANGES.md",
+    "HISTORY.md",
+    "RELEASES.md",
+    "UPGRADING.md",
+    "MIGRATION.md",
+    "docs/CHANGELOG.md",
+    "docs/UPGRADING.md",
+    "docs/migration.md",
+    "book/src/CHANGELOG.md",
+]
+RELEASE_NOTES_SCAN_MANIFESTS = [
+    "/Users/jmease/repos/vl-convert/Cargo.toml",
+    "/Users/jmease/repos/vegafusion/Cargo.toml",
+    "/Users/jmease/repos/avenger/Cargo.toml",
+]
 
 # Cargo.lock metadata (populated at startup if --project-dir is provided)
 _cargo_lock_versions: dict[str, list[str]] = {}
@@ -79,7 +114,15 @@ _rustdoc_cache: OrderedDict[
 ] = OrderedDict()
 _crates_cache: OrderedDict[str, tuple[float, dict[str, Any]]] = OrderedDict()
 _crate_source_cache: OrderedDict[tuple[str, str], tuple[float, bytes]] = OrderedDict()
+_release_notes_result_cache: OrderedDict[
+    tuple[Any, ...], tuple[float, dict[str, Any]]
+] = OrderedDict()
+_release_notes_http_cache: OrderedDict[
+    str, tuple[float, bytes, str, dict[str, str], str | None]
+] = OrderedDict()
 _data_cache_lock = Lock()
+_github_token_from_cli: str | None = None
+_github_token_bootstrap_attempted = False
 
 
 class DataError(Exception):
@@ -90,6 +133,14 @@ class DataError(Exception):
         self.code = code
         self.message = message
         self.context = context or {}
+
+
+@dataclass
+class RepositoryRef:
+    host: str
+    owner: str
+    name: str
+    repo_path: str
 
 
 def _parse_semver(version: str) -> tuple[int, int, int, tuple[Any, ...], bool] | None:
@@ -199,6 +250,227 @@ def resolve_version(
     return DEFAULT_VERSION, "default"
 
 
+def _normalize_version_source_label(version_source: str) -> str:
+    return "latest" if version_source == "default" else version_source
+
+
+def _dedupe_preserve_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        deduped.append(value)
+        seen.add(value)
+    return deduped
+
+
+def _extract_semver_from_text(text: str) -> str | None:
+    match = re.search(r"(?<!\d)(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)(?!\d)", text)
+    if not match:
+        return None
+    return match.group(1)
+
+
+def _version_between(version: str, lower: str, upper: str) -> bool:
+    return _version_sort_key(lower) <= _version_sort_key(version) <= _version_sort_key(upper)
+
+
+def _stable_crates_io_versions(crate_record: dict[str, Any]) -> list[str]:
+    versions = []
+    for record in crate_record.get("versions", []):
+        if not isinstance(record, dict):
+            continue
+        num = record.get("num")
+        if not isinstance(num, str):
+            continue
+        parsed = _parse_semver(num)
+        if parsed is None:
+            continue
+        if parsed[4] is False:
+            continue
+        if record.get("yanked") is True:
+            continue
+        versions.append(num)
+
+    return sorted(set(versions), key=_version_sort_key)
+
+
+def _resolve_version_from_project_dir(crate_name: str, project_dir: str | None) -> str | None:
+    if not project_dir:
+        return None
+
+    try:
+        lock_path = Path(project_dir).resolve() / "Cargo.lock"
+        if not lock_path.exists():
+            return None
+        versions, _ = parse_cargo_lock(lock_path)
+        return select_preferred_version(versions.get(crate_name, []))
+    except Exception:
+        return None
+
+
+async def resolve_release_notes_interval(
+    crate_name: str,
+    from_version: str | None,
+    to_version: str | None,
+    project_dir: str | None,
+) -> tuple[str, str, str, list[str], dict[str, Any]]:
+    crate_record = await fetch_crates_io_crate(crate_name)
+    stable_versions = _stable_crates_io_versions(crate_record)
+
+    if to_version:
+        resolved_to = to_version
+        version_source = "explicit"
+    else:
+        from_project = _resolve_version_from_project_dir(crate_name, project_dir)
+        if from_project:
+            resolved_to = from_project
+            version_source = "cargo_lock"
+        elif crate_name in _cargo_lock_versions:
+            from_global_lock = select_preferred_version(_cargo_lock_versions[crate_name])
+            if from_global_lock:
+                resolved_to = from_global_lock
+                version_source = "cargo_lock"
+            else:
+                resolved_to = (
+                    crate_record.get("crate", {}).get("max_stable_version")
+                    or crate_record.get("crate", {}).get("max_version")
+                    or DEFAULT_VERSION
+                )
+                version_source = "latest"
+        else:
+            resolved_to = (
+                crate_record.get("crate", {}).get("max_stable_version")
+                or crate_record.get("crate", {}).get("max_version")
+                or DEFAULT_VERSION
+            )
+            version_source = "latest"
+
+    if from_version:
+        resolved_from = from_version
+    else:
+        previous_versions = [
+            version for version in stable_versions if _version_sort_key(version) < _version_sort_key(resolved_to)
+        ]
+        resolved_from = previous_versions[-1] if previous_versions else resolved_to
+
+    if _version_sort_key(resolved_from) > _version_sort_key(resolved_to):
+        raise DataError(
+            "version_interval_invalid",
+            "from_version must be less than or equal to to_version",
+            context={
+                "crate": crate_name,
+                "from_version": resolved_from,
+                "to_version": resolved_to,
+            },
+        )
+
+    versions_in_range = [
+        version
+        for version in stable_versions
+        if _version_between(version, resolved_from, resolved_to)
+    ]
+    if not versions_in_range:
+        versions_in_range = [resolved_from, resolved_to]
+    versions_in_range = _dedupe_preserve_order(versions_in_range)
+
+    return (
+        resolved_from,
+        resolved_to,
+        _normalize_version_source_label(version_source),
+        versions_in_range,
+        crate_record,
+    )
+
+
+def parse_repository_ref(repository_url: str | None) -> RepositoryRef | None:
+    if not repository_url:
+        return None
+
+    repo_url = repository_url.strip()
+    if not repo_url:
+        return None
+
+    scp_match = re.match(r"^git@([^:]+):(.+)$", repo_url)
+    if scp_match:
+        host = scp_match.group(1).lower()
+        repo_path = scp_match.group(2).strip("/")
+    else:
+        parsed = urlparse(repo_url)
+        host = parsed.netloc.lower()
+        repo_path = parsed.path.strip("/")
+
+    if repo_path.endswith(".git"):
+        repo_path = repo_path[:-4]
+    if not host or not repo_path or "/" not in repo_path:
+        return None
+
+    parts = repo_path.split("/")
+    owner = "/".join(parts[:-1])
+    name = parts[-1]
+    return RepositoryRef(host=host, owner=owner, name=name, repo_path=repo_path)
+
+
+def bootstrap_github_token_from_gh_cli() -> bool:
+    """Load GitHub token from `gh auth token` once if env tokens are not set."""
+    global _github_token_from_cli, _github_token_bootstrap_attempted
+
+    env_token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if env_token:
+        return True
+
+    if _github_token_from_cli:
+        return True
+    if _github_token_bootstrap_attempted:
+        return False
+    _github_token_bootstrap_attempted = True
+
+    if shutil.which("gh") is None:
+        return False
+
+    try:
+        proc = subprocess.run(
+            ["gh", "auth", "token"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except Exception:
+        return False
+
+    if proc.returncode != 0:
+        return False
+
+    token = proc.stdout.strip()
+    if not token:
+        return False
+
+    _github_token_from_cli = token
+    logger.info("Loaded GitHub token from gh CLI for release-notes lookups")
+    return True
+
+
+def github_api_headers() -> dict[str, str]:
+    headers = {"Accept": "application/vnd.github+json"}
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if not token:
+        bootstrap_github_token_from_gh_cli()
+        token = _github_token_from_cli
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def gitlab_api_headers() -> dict[str, str]:
+    headers = {"Accept": "application/json"}
+    token = os.environ.get("GITLAB_TOKEN")
+    if token:
+        headers["PRIVATE-TOKEN"] = token
+    return headers
+
+
 def _dependency_source_from_spec(spec: Any) -> str | None:
     if not isinstance(spec, dict):
         return None
@@ -217,6 +489,14 @@ def _dependency_name_from_entry(dep_name: str, dep_spec: Any) -> str:
     if isinstance(dep_spec, dict) and isinstance(dep_spec.get("package"), str):
         return dep_spec["package"]
     return dep_name
+
+
+def _dependency_requested_version(dep_spec: Any) -> str | None:
+    if isinstance(dep_spec, str):
+        return dep_spec
+    if isinstance(dep_spec, dict) and isinstance(dep_spec.get("version"), str):
+        return dep_spec["version"]
+    return None
 
 
 def _collect_dependency_entries_from_manifest_table(
@@ -248,6 +528,7 @@ def _collect_dependency_entries_from_manifest_table(
                     "kind": kind,
                     "declared_in": manifest_rel_path,
                     "source": _dependency_source_from_spec(dep_spec),
+                    "requested_version": _dependency_requested_version(dep_spec),
                 }
             )
 
@@ -605,6 +886,83 @@ def _set_cached_source_bytes(key: tuple[str, str], data: bytes) -> None:
         _crate_source_cache.move_to_end(key)
         while len(_crate_source_cache) > CACHE_MAX_ENTRIES:
             _crate_source_cache.popitem(last=False)
+
+
+def _get_cached_release_notes_http(
+    url: str,
+) -> tuple[bytes, str, dict[str, str], str | None] | None:
+    now = time.time()
+    with _data_cache_lock:
+        cached = _release_notes_http_cache.get(url)
+        if not cached:
+            return None
+        timestamp, body, final_url, headers, etag = cached
+        if now - timestamp > CACHE_TTL_SECONDS:
+            return body, final_url, headers, etag
+
+        _release_notes_http_cache.move_to_end(url)
+        return body, final_url, headers, etag
+
+
+def _set_cached_release_notes_http(
+    url: str,
+    body: bytes,
+    final_url: str,
+    headers: dict[str, str],
+    etag: str | None,
+) -> None:
+    now = time.time()
+    with _data_cache_lock:
+        _release_notes_http_cache[url] = (now, body, final_url, headers, etag)
+        _release_notes_http_cache.move_to_end(url)
+        while len(_release_notes_http_cache) > CACHE_MAX_ENTRIES:
+            _release_notes_http_cache.popitem(last=False)
+
+
+async def fetch_release_notes_resource(
+    url: str,
+    headers: dict[str, str] | None = None,
+) -> tuple[int, bytes | None, str, dict[str, str]]:
+    cached = _get_cached_release_notes_http(url)
+    request_headers = dict(headers or {})
+    if cached:
+        _, _, _, etag = cached
+        if etag:
+            request_headers.setdefault("If-None-Match", etag)
+
+    client = await _get_http_client()
+    try:
+        response = await client.get(url, headers=request_headers, timeout=RELEASE_NOTES_HTTP_TIMEOUT_SECONDS)
+    except Exception as exc:
+        raise DataError(
+            "repository_unavailable",
+            f"Failed to fetch external release-notes source: {exc}",
+            context={"url": url},
+        ) from exc
+
+    status = response.status_code
+    response_headers = {k.lower(): v for k, v in response.headers.items()}
+    final_url = str(response.url)
+
+    if status == 304 and cached:
+        cached_body, cached_final_url, cached_headers, cached_etag = cached
+        _set_cached_release_notes_http(
+            url, cached_body, cached_final_url, cached_headers, cached_etag
+        )
+        return 200, cached_body, cached_final_url, cached_headers
+
+    body = response.content
+    if 200 <= status < 300:
+        _set_cached_release_notes_http(
+            url,
+            body,
+            final_url,
+            response_headers,
+            response_headers.get("etag"),
+        )
+        return status, body, final_url, response_headers
+
+    return status, body, final_url, response_headers
 
 
 async def fetch_json_from_url(url: str) -> dict[str, Any]:
@@ -1866,6 +2224,1792 @@ def read_source_file_from_archive(
             )
 
         return file_obj.read().decode("utf-8", errors="replace")
+
+
+def _is_rate_limited(status: int, headers: dict[str, str]) -> bool:
+    if status == 429:
+        return True
+    if status == 403 and headers.get("x-ratelimit-remaining") == "0":
+        return True
+    if status == 403 and headers.get("ratelimit-remaining") == "0":
+        return True
+    return False
+
+
+def _record_source_scan(
+    sources_scanned: list[dict[str, Any]],
+    source_type: str,
+    url: str,
+    status: int,
+    note: str | None = None,
+) -> None:
+    row = {
+        "source_type": source_type,
+        "url": url,
+        "status": status,
+    }
+    if note:
+        row["note"] = note
+    sources_scanned.append(row)
+
+
+def _new_release_probe() -> dict[str, int]:
+    return {
+        "release_list_pages_scanned": 0,
+        "release_list_items_seen": 0,
+        "release_tag_api_hits": 0,
+        "release_tag_api_404": 0,
+        "empty_release_bodies": 0,
+    }
+
+
+def _add_available_release_ref(
+    available_release_refs: list[dict[str, Any]],
+    *,
+    tag: str,
+    url: str,
+    status: int,
+    source: str,
+) -> None:
+    row = {
+        "tag": tag,
+        "url": url,
+        "status": status,
+        "source": source,
+    }
+    if row not in available_release_refs:
+        available_release_refs.append(row)
+
+
+def _parse_link_header_next(headers: dict[str, str]) -> str | None:
+    link_header = headers.get("link")
+    if not link_header:
+        return None
+    for part in link_header.split(","):
+        match = re.match(r'\s*<([^>]+)>\s*;\s*rel="([^"]+)"', part.strip())
+        if not match:
+            continue
+        if match.group(2) == "next":
+            return match.group(1)
+    return None
+
+
+def _iter_payload_candidates(
+    body: bytes,
+    final_url: str,
+    headers: dict[str, str],
+) -> list[bytes]:
+    content_type = headers.get("content-type", "")
+    content_encoding = headers.get("content-encoding", "")
+    content_disposition = headers.get("content-disposition", "")
+
+    queue: list[tuple[bytes, int]] = [(body, 0)]
+    seen: set[tuple[int, bytes]] = set()
+    candidates: list[bytes] = []
+    max_depth = 3
+
+    while queue:
+        candidate, depth = queue.pop(0)
+        key = (len(candidate), candidate[:16])
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(candidate)
+        if depth >= max_depth:
+            continue
+
+        gzip_hint = (
+            candidate.startswith(b"\x1f\x8b")
+            or (depth == 0 and final_url.endswith(".gz"))
+            or (depth == 0 and "gzip" in content_type)
+            or (depth == 0 and "gzip" in content_encoding)
+        )
+        if gzip_hint:
+            try:
+                queue.append((gzip.decompress(candidate), depth + 1))
+            except Exception:
+                pass
+
+        zstd_hint = (
+            _looks_like_zstd(candidate)
+            or (depth == 0 and "zstd" in content_encoding)
+            or (depth == 0 and ".zst" in content_disposition)
+        )
+        if zstd_hint:
+            try:
+                import zstandard as zstd
+
+                dctx = zstd.ZstdDecompressor()
+                with dctx.stream_reader(io.BytesIO(candidate)) as reader:
+                    queue.append((reader.read(), depth + 1))
+            except Exception:
+                pass
+
+    return candidates
+
+
+def _parse_json_http_payload(
+    body: bytes,
+    final_url: str,
+    headers: dict[str, str],
+) -> dict[str, Any] | list[Any]:
+    candidates = _iter_payload_candidates(body, final_url, headers)
+    last_error: Exception | None = None
+    for candidate in candidates:
+        try:
+            payload = json_loads_bytes(candidate)
+            if isinstance(payload, (dict, list)):
+                return payload
+        except Exception as exc:
+            last_error = exc
+            continue
+
+    raise DataError(
+        "repository_unavailable",
+        f"Failed to parse JSON response payload: {last_error}",
+        context={"url": final_url},
+    )
+
+
+def _decode_text_http_payload(
+    body: bytes,
+    final_url: str,
+    headers: dict[str, str],
+) -> str:
+    candidates = _iter_payload_candidates(body, final_url, headers)
+    for candidate in candidates:
+        try:
+            return candidate.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+    return body.decode("utf-8", errors="replace")
+
+
+def _strip_html_to_text(content: str) -> str:
+    lower = content.lower()
+    if "<html" not in lower and "<body" not in lower and "<div" not in lower:
+        return content
+
+    text = re.sub(r"(?is)<script[^>]*>.*?</script>", " ", content)
+    text = re.sub(r"(?is)<style[^>]*>.*?</style>", " ", text)
+    text = re.sub(r"(?is)<[^>]+>", " ", text)
+    return normalize_whitespace(text)
+
+
+def _first_excerpt(text: str, max_chars: int = 600) -> str:
+    normalized = normalize_whitespace(text)
+    if len(normalized) <= max_chars:
+        return normalized
+    return normalized[: max_chars - 3].rstrip() + "..."
+
+
+def _release_tag_candidates(crate_name: str, repo_name: str, version: str) -> list[str]:
+    candidates: list[str] = []
+    if repo_name == "tokio" or crate_name.startswith("tokio"):
+        candidates.append(f"tokio-{version}")
+    candidates.extend(
+        [
+            f"v{version}",
+            version,
+            f"{crate_name}-{version}",
+            f"{repo_name}-{version}",
+        ]
+    )
+    return _dedupe_preserve_order(candidates)
+
+
+def _version_minor_series(version: str) -> str | None:
+    parsed = _parse_semver(version)
+    if not parsed:
+        return None
+    major, minor, _, _, _ = parsed
+    return f"{major}.{minor}"
+
+
+def _release_notes_changelog_paths(crate_name: str, versions_in_range: list[str]) -> list[str]:
+    paths = list(RELEASE_NOTES_CHANGELOG_PATHS)
+    if _is_datafusion_family(crate_name):
+        descending_versions = sorted(
+            set(versions_in_range), key=_version_sort_key, reverse=True
+        )
+        series_seen: set[str] = set()
+        for version in descending_versions[:20]:
+            paths.append(f"dev/changelog/{version}.md")
+            series = _version_minor_series(version)
+            if series and series not in series_seen:
+                paths.append(f"dev/changelog/{series}.0.md")
+                series_seen.add(series)
+    return _dedupe_preserve_order(paths)
+
+
+def _tag_matches_interval(tag_name: str, versions_in_range: set[str]) -> tuple[bool, str | None]:
+    cleaned = tag_name.strip()
+    if cleaned in versions_in_range:
+        return True, cleaned
+    if cleaned.startswith("v") and cleaned[1:] in versions_in_range:
+        return True, cleaned[1:]
+
+    extracted = _extract_semver_from_text(cleaned)
+    if extracted and extracted in versions_in_range:
+        return True, extracted
+    return False, None
+
+
+def _markdown_sections(markdown: str) -> list[tuple[str, str]]:
+    lines = (markdown or "").splitlines()
+    sections: list[tuple[str, str]] = []
+    current_heading = "Document"
+    current_lines: list[str] = []
+
+    heading_re = re.compile(r"^\s{0,3}#{1,6}\s+(.*)$")
+    for line in lines:
+        match = heading_re.match(line)
+        if match:
+            if current_lines:
+                sections.append((current_heading, "\n".join(current_lines).strip()))
+            current_heading = match.group(1).strip()
+            current_lines = []
+            continue
+        current_lines.append(line)
+
+    if current_lines:
+        sections.append((current_heading, "\n".join(current_lines).strip()))
+
+    if not sections:
+        return [("Document", markdown.strip())]
+    return sections
+
+
+def _extract_relevant_markdown(
+    markdown: str,
+    versions_in_range: set[str],
+) -> tuple[str, str, bool]:
+    sections = _markdown_sections(markdown)
+    matched_sections: list[tuple[str, str]] = []
+    for heading, body in sections:
+        heading_lc = heading.lower()
+        body_lc = body.lower()
+        matched = False
+        for version in versions_in_range:
+            if version.lower() in heading_lc:
+                matched = True
+                break
+            if f"v{version}".lower() in heading_lc:
+                matched = True
+                break
+            if version.lower() in body_lc:
+                matched = True
+                break
+        if matched:
+            matched_sections.append((heading, body))
+
+    if matched_sections:
+        selected = matched_sections[:3]
+        rendered = "\n\n".join(
+            f"## {heading}\n{body}".strip() for heading, body in selected if body
+        ).strip()
+        return _first_excerpt(rendered), rendered, True
+
+    fallback = "\n\n".join(
+        f"## {heading}\n{body}".strip() for heading, body in sections[:2] if body
+    ).strip()
+    return _first_excerpt(fallback), fallback, False
+
+
+def _normalize_release_note_line(raw_line: str) -> str:
+    cleaned = _strip_html_to_text(raw_line.strip())
+    cleaned = normalize_whitespace(cleaned)
+    cleaned = cleaned.strip("`*_#>- ")
+    return cleaned
+
+
+def _is_generic_heading_line(line: str) -> bool:
+    lowered = line.lower().strip()
+    return lowered in {
+        "added",
+        "changed",
+        "fixed",
+        "removed",
+        "deprecated",
+        "migration",
+        "migrations",
+        "upgrade",
+        "upgrading",
+        "new features",
+    }
+
+
+def _classify_release_note_line(line: str) -> str | None:
+    lowered = line.lower()
+    if any(token in lowered for token in ["breaking", "incompatib", "removed", "rename"]):
+        return "breaking_changes"
+    if any(token in lowered for token in ["migration", "upgrade", "porting", "must "]):
+        return "migration_steps"
+    if "deprecat" in lowered:
+        return "deprecations"
+    if any(token in lowered for token in ["new ", "added", "feature"]):
+        return "new_features"
+    return None
+
+
+def _build_release_notes_summary(items: list[dict[str, Any]]) -> dict[str, Any]:
+    buckets: dict[str, list[str]] = {
+        "breaking_changes": [],
+        "migration_steps": [],
+        "deprecations": [],
+        "new_features": [],
+    }
+
+    for item in items:
+        text = item.get("content_markdown") or item.get("content_excerpt") or ""
+        lines = []
+        for raw_line in text.splitlines():
+            stripped = raw_line.strip()
+            if not stripped:
+                continue
+            normalized_line = stripped
+            if stripped.startswith(("-", "*", "+")):
+                normalized_line = stripped[1:].strip()
+            elif re.match(r"^\d+\.\s+", stripped):
+                normalized_line = re.sub(r"^\d+\.\s+", "", stripped)
+            elif len(stripped) > 180:
+                continue
+            normalized_line = _normalize_release_note_line(normalized_line)
+            if not normalized_line:
+                continue
+            if _is_generic_heading_line(normalized_line):
+                continue
+            lines.append(normalized_line)
+
+        for line in lines:
+            bucket = _classify_release_note_line(line)
+            if bucket is None:
+                continue
+            if line not in buckets[bucket]:
+                buckets[bucket].append(line)
+
+    for key in buckets:
+        buckets[key] = buckets[key][:20]
+
+    found_count = len(items)
+    if found_count >= 3 and (buckets["breaking_changes"] or buckets["migration_steps"]):
+        notes_quality = "high"
+    elif found_count >= 1:
+        notes_quality = "medium"
+    else:
+        notes_quality = "low"
+
+    return {
+        "breaking_changes": buckets["breaking_changes"],
+        "migration_steps": buckets["migration_steps"],
+        "deprecations": buckets["deprecations"],
+        "new_features": buckets["new_features"],
+        "notes_quality": notes_quality,
+    }
+
+
+def _make_release_note_item(
+    *,
+    source_type: str,
+    title: str,
+    url: str,
+    content: str,
+    relevance_score: int,
+    host: str,
+    repo: str,
+    path: str,
+    selection_reason: str,
+    published_at: str | None = None,
+    version_tag: str | None = None,
+) -> dict[str, Any]:
+    clean_content = content.strip()
+    return {
+        "source_type": source_type,
+        "title": title,
+        "url": url,
+        "published_at": published_at,
+        "version_tag": version_tag,
+        "content_excerpt": _first_excerpt(clean_content),
+        "content_markdown": clean_content[:MAX_CONTENT_LENGTH],
+        "relevance_score": relevance_score,
+        "provenance": {
+            "host": host,
+            "repo": repo,
+            "path": path,
+            "selection_reason": selection_reason,
+        },
+    }
+
+
+def _extract_github_release_body_from_html(html: str) -> str:
+    container_patterns = [
+        r'(?is)<div[^>]*class="[^"]*markdown-body[^"]*"[^>]*>(.*?)</div>',
+        r"(?is)<include-fragment[^>]*aria-label=\"Release notes\"[^>]*>(.*?)</include-fragment>",
+    ]
+    for pattern in container_patterns:
+        match = re.search(pattern, html)
+        if not match:
+            continue
+        candidate = _strip_html_to_text(match.group(1))
+        if candidate and len(candidate.split()) >= 8:
+            return candidate
+    return ""
+
+
+def _extract_html_links(content: str, base_url: str) -> list[str]:
+    matches = re.findall(r'(?is)href=["\']([^"\']+)["\']', content)
+    links: list[str] = []
+    for href in matches:
+        href = href.strip()
+        if not href or href.startswith("#"):
+            continue
+        if href.startswith(("javascript:", "mailto:", "tel:")):
+            continue
+        links.append(urljoin(base_url, href))
+    return _dedupe_preserve_order(links)
+
+
+def _extract_upgrade_page_text(content: str) -> str:
+    container_patterns = [
+        r"(?is)<main[^>]*>(.*?)</main>",
+        r"(?is)<article[^>]*>(.*?)</article>",
+        r'(?is)<div[^>]*class="[^"]*(?:bd-article|document|wy-nav-content|content)[^"]*"[^>]*>(.*?)</div>',
+    ]
+    for pattern in container_patterns:
+        match = re.search(pattern, content)
+        if not match:
+            continue
+        candidate = _strip_html_to_text(match.group(1))
+        if len(candidate.split()) >= 20:
+            return candidate
+    return _strip_html_to_text(content)
+
+
+def _datafusion_upgrade_link_candidates(
+    html: str,
+    base_url: str,
+    versions_in_range: set[str],
+) -> list[tuple[str, str, bool]]:
+    versions_by_series: dict[str, set[str]] = {}
+    for version in versions_in_range:
+        series = _version_minor_series(version)
+        if series:
+            versions_by_series.setdefault(series, set()).add(version)
+
+    candidates: list[tuple[str, str, bool]] = []
+    for link in _extract_html_links(html, base_url):
+        parsed = urlparse(link)
+        if "datafusion.apache.org" not in parsed.netloc:
+            continue
+        path_lc = parsed.path.lower()
+        if "/library-user-guide/upgrading/" not in path_lc:
+            continue
+        if not path_lc.endswith(".html"):
+            continue
+        version = _extract_semver_from_text(path_lc)
+        if not version:
+            continue
+
+        is_exact = version in versions_in_range
+        if not is_exact:
+            version_series = _version_minor_series(version)
+            if version_series and version_series in versions_by_series:
+                # DataFusion patch upgrades often map to X.Y.0 guide pages.
+                is_exact = True
+
+        if is_exact:
+            candidates.append((link, version, version in versions_in_range))
+
+    candidates = _dedupe_preserve_order(candidates)
+    candidates.sort(key=lambda row: _version_sort_key(row[1]), reverse=True)
+    return candidates[:8]
+
+
+async def _collect_github_release_page_fallback(
+    crate_name: str,
+    repo_path: str,
+    versions_in_range: set[str],
+    already_matched_versions: set[str],
+    sources_scanned: list[dict[str, Any]],
+    release_probe: dict[str, int],
+    confirmed_tag_urls: list[str],
+    available_release_refs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    descending_versions = sorted(versions_in_range, key=_version_sort_key, reverse=True)
+
+    for version in descending_versions:
+        if version in already_matched_versions:
+            continue
+        for tag in _release_tag_candidates(crate_name, repo_path.split("/")[-1], version):
+            release_page_url = f"https://github.com/{repo_path}/releases/tag/{quote(tag, safe='')}"
+            status, body, final_url, response_headers = await fetch_release_notes_resource(
+                release_page_url
+            )
+            _record_source_scan(
+                sources_scanned, "github_release_page_fallback", final_url, status
+            )
+            if status != 200 or body is None:
+                continue
+            if final_url not in confirmed_tag_urls:
+                confirmed_tag_urls.append(final_url)
+            _add_available_release_ref(
+                available_release_refs,
+                tag=tag,
+                url=final_url,
+                status=status,
+                source="github_release_page",
+            )
+            html = _decode_text_http_payload(body, final_url, response_headers)
+            release_body = _extract_github_release_body_from_html(html)
+            if not release_body:
+                continue
+            items.append(
+                _make_release_note_item(
+                    source_type="github_release",
+                    title=f"Release {tag}",
+                    url=final_url,
+                    content=release_body,
+                    relevance_score=75,
+                    host="github.com",
+                    repo=repo_path,
+                    path=f"releases/tag/{tag}",
+                    selection_reason="release_page_fallback",
+                    version_tag=tag,
+                )
+            )
+            already_matched_versions.add(version)
+            break
+    return items
+
+
+async def _collect_github_changelog_raw_fallback(
+    crate_name: str,
+    repo_path: str,
+    versions_in_range_ordered: list[str],
+    versions_in_range: set[str],
+    sources_scanned: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    changelog_paths = _release_notes_changelog_paths(crate_name, versions_in_range_ordered)
+    for branch in ["main", "master", "trunk"]:
+        branch_found = False
+        for changelog_path in changelog_paths:
+            raw_url = (
+                f"https://raw.githubusercontent.com/{repo_path}/{branch}/{changelog_path}"
+            )
+            status, body, final_url, response_headers = await fetch_release_notes_resource(
+                raw_url
+            )
+            _record_source_scan(
+                sources_scanned, "github_changelog_raw_fallback", final_url, status
+            )
+            if status != 200 or body is None:
+                continue
+            markdown = _decode_text_http_payload(body, final_url, response_headers)
+            excerpt, selected_markdown, matched = _extract_relevant_markdown(
+                markdown, versions_in_range
+            )
+            score = 80 if matched else 50
+            items.append(
+                _make_release_note_item(
+                    source_type="github_changelog_file",
+                    title=f"{changelog_path} ({branch})",
+                    url=final_url,
+                    content=selected_markdown,
+                    relevance_score=score,
+                    host="github.com",
+                    repo=repo_path,
+                    path=f"{branch}/{changelog_path}",
+                    selection_reason="raw_changelog_fallback",
+                )
+            )
+            branch_found = True
+            break
+        if branch_found:
+            break
+    return items
+
+
+async def _collect_github_release_items(
+    crate_name: str,
+    repo: RepositoryRef,
+    versions_in_range: list[str],
+    include_release_descriptions: bool,
+    include_changelog_files: bool,
+    sources_scanned: list[dict[str, Any]],
+    warnings: list[str],
+    release_probe: dict[str, int],
+    confirmed_tag_urls: list[str],
+    available_release_refs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    versions_set = set(versions_in_range)
+    changelog_paths = _release_notes_changelog_paths(crate_name, versions_in_range)
+    headers = github_api_headers()
+    repo_path = f"{repo.owner}/{repo.name}"
+
+    repo_meta_url = f"https://api.github.com/repos/{repo_path}"
+    status, body, final_url, response_headers = await fetch_release_notes_resource(
+        repo_meta_url, headers=headers
+    )
+    _record_source_scan(sources_scanned, "github_repo", final_url, status)
+    if _is_rate_limited(status, response_headers):
+        warnings.append("rate_limited:github")
+    if status != 200 or body is None:
+        if include_release_descriptions:
+            items.extend(
+                await _collect_github_release_page_fallback(
+                    crate_name=crate_name,
+                    repo_path=repo_path,
+                    versions_in_range=versions_set,
+                    already_matched_versions=set(),
+                    sources_scanned=sources_scanned,
+                    release_probe=release_probe,
+                    confirmed_tag_urls=confirmed_tag_urls,
+                    available_release_refs=available_release_refs,
+                )
+            )
+        if include_changelog_files:
+            items.extend(
+                await _collect_github_changelog_raw_fallback(
+                    crate_name=crate_name,
+                    repo_path=repo_path,
+                    versions_in_range_ordered=versions_in_range,
+                    versions_in_range=versions_set,
+                    sources_scanned=sources_scanned,
+                )
+            )
+        return items
+
+    payload = _parse_json_http_payload(body, final_url, response_headers)
+    if not isinstance(payload, dict):
+        return items
+    default_branch = payload.get("default_branch") or "main"
+
+    matched_versions: set[str] = set()
+    empty_release_body_versions: set[str] = set()
+    if include_release_descriptions:
+        descending_versions = sorted(versions_set, key=_version_sort_key, reverse=True)
+        for version in descending_versions:
+            found_for_version = False
+            for tag in _release_tag_candidates(crate_name, repo.name, version):
+                tag_url = (
+                    f"https://api.github.com/repos/{repo_path}/releases/tags/"
+                    f"{quote(tag, safe='')}"
+                )
+                status, body, final_url, response_headers = await fetch_release_notes_resource(
+                    tag_url, headers=headers
+                )
+                _record_source_scan(sources_scanned, "github_release_tag", final_url, status)
+                if status == 404:
+                    release_probe["release_tag_api_404"] += 1
+                if _is_rate_limited(status, response_headers):
+                    warnings.append("rate_limited:github")
+                    continue
+                if status != 200 or body is None:
+                    continue
+
+                release = _parse_json_http_payload(body, final_url, response_headers)
+                if not isinstance(release, dict):
+                    continue
+                release_probe["release_tag_api_hits"] += 1
+                release_body = str(release.get("body") or "").strip()
+                release_tag = str(release.get("tag_name") or tag)
+                release_url = str(release.get("html_url") or final_url)
+                if not release_body:
+                    release_probe["empty_release_bodies"] += 1
+                    empty_release_body_versions.add(version)
+                    _add_available_release_ref(
+                        available_release_refs,
+                        tag=release_tag,
+                        url=release_url,
+                        status=status,
+                        source="github_release_api",
+                    )
+                    continue
+                matched_versions.add(version)
+                items.append(
+                    _make_release_note_item(
+                        source_type="github_release",
+                        title=str(release.get("name") or f"Release {release_tag}"),
+                        url=release_url,
+                        content=release_body,
+                        relevance_score=100,
+                        host="github.com",
+                        repo=repo_path,
+                        path=f"releases/tags/{release_tag}",
+                        selection_reason="exact_tag_match",
+                        published_at=release.get("published_at"),
+                        version_tag=release_tag,
+                    )
+                )
+                found_for_version = True
+                break
+            if found_for_version:
+                continue
+
+        next_releases_url: str | None = (
+            f"https://api.github.com/repos/{repo_path}/releases?per_page={RELEASE_NOTES_MAX_RELEASE_SCAN}"
+        )
+        pages_scanned = 0
+        while next_releases_url and pages_scanned < RELEASE_NOTES_MAX_RELEASE_PAGES:
+            pages_scanned += 1
+            status, body, final_url, response_headers = await fetch_release_notes_resource(
+                next_releases_url, headers=headers
+            )
+            _record_source_scan(
+                sources_scanned,
+                "github_releases_list_page",
+                final_url,
+                status,
+                note=f"page={pages_scanned}",
+            )
+            release_probe["release_list_pages_scanned"] += 1
+            if _is_rate_limited(status, response_headers):
+                warnings.append("rate_limited:github")
+                break
+            if status != 200 or body is None:
+                break
+
+            releases = _parse_json_http_payload(body, final_url, response_headers)
+            if not isinstance(releases, list):
+                break
+
+            release_probe["release_list_items_seen"] += len(releases)
+            for release in releases:
+                if not isinstance(release, dict):
+                    continue
+                tag_name = str(release.get("tag_name") or "")
+                matches, matched_version = _tag_matches_interval(tag_name, versions_set)
+                if not matches or not matched_version:
+                    continue
+                if matched_version in matched_versions:
+                    continue
+                release_body = str(release.get("body") or "").strip()
+                release_url = str(release.get("html_url") or final_url)
+                if not release_body:
+                    release_probe["empty_release_bodies"] += 1
+                    empty_release_body_versions.add(matched_version)
+                    _add_available_release_ref(
+                        available_release_refs,
+                        tag=tag_name,
+                        url=release_url,
+                        status=status,
+                        source="github_releases_list",
+                    )
+                    continue
+                matched_versions.add(matched_version)
+                items.append(
+                    _make_release_note_item(
+                        source_type="github_release",
+                        title=str(release.get("name") or f"Release {tag_name}"),
+                        url=release_url,
+                        content=release_body,
+                        relevance_score=85,
+                        host="github.com",
+                        repo=repo_path,
+                        path="releases",
+                        selection_reason="release_list_match",
+                        published_at=release.get("published_at"),
+                        version_tag=tag_name,
+                    )
+                )
+
+            if matched_versions >= versions_set:
+                break
+            next_releases_url = _parse_link_header_next(response_headers)
+
+        items.extend(
+            await _collect_github_release_page_fallback(
+                crate_name=crate_name,
+                repo_path=repo_path,
+                versions_in_range=versions_set,
+                already_matched_versions=matched_versions | empty_release_body_versions,
+                sources_scanned=sources_scanned,
+                release_probe=release_probe,
+                confirmed_tag_urls=confirmed_tag_urls,
+                available_release_refs=available_release_refs,
+            )
+        )
+
+    changelog_item_found = False
+    if include_changelog_files:
+        for changelog_path in changelog_paths:
+            content_url = (
+                f"https://api.github.com/repos/{repo_path}/contents/"
+                f"{quote(changelog_path, safe='/')}?ref={quote(default_branch, safe='')}"
+            )
+            status, body, final_url, response_headers = await fetch_release_notes_resource(
+                content_url, headers=headers
+            )
+            _record_source_scan(sources_scanned, "github_changelog_lookup", final_url, status)
+            if _is_rate_limited(status, response_headers):
+                warnings.append("rate_limited:github")
+            if status != 200 or body is None:
+                continue
+
+            content_meta = _parse_json_http_payload(body, final_url, response_headers)
+            if not isinstance(content_meta, dict):
+                continue
+            download_url = content_meta.get("download_url")
+            if not isinstance(download_url, str) or not download_url:
+                continue
+
+            status, body, final_url, response_headers = await fetch_release_notes_resource(
+                download_url, headers=headers
+            )
+            _record_source_scan(sources_scanned, "github_changelog_raw", final_url, status)
+            if status != 200 or body is None:
+                continue
+
+            markdown = _decode_text_http_payload(body, final_url, response_headers)
+            excerpt, selected_markdown, matched = _extract_relevant_markdown(
+                markdown, versions_set
+            )
+            score = 88 if matched else 55
+            items.append(
+                _make_release_note_item(
+                    source_type="github_changelog_file",
+                    title=changelog_path,
+                    url=download_url,
+                    content=selected_markdown,
+                    relevance_score=score,
+                    host="github.com",
+                    repo=repo_path,
+                    path=changelog_path,
+                    selection_reason="version_section_match" if matched else "fallback_changelog",
+                )
+            )
+            changelog_item_found = True
+
+        if not changelog_item_found:
+            items.extend(
+                await _collect_github_changelog_raw_fallback(
+                    crate_name=crate_name,
+                    repo_path=repo_path,
+                    versions_in_range_ordered=versions_in_range,
+                    versions_in_range=versions_set,
+                    sources_scanned=sources_scanned,
+                )
+            )
+
+    return items
+
+
+async def _collect_gitlab_release_items(
+    crate_name: str,
+    repo: RepositoryRef,
+    versions_in_range: list[str],
+    include_release_descriptions: bool,
+    include_changelog_files: bool,
+    sources_scanned: list[dict[str, Any]],
+    warnings: list[str],
+) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    versions_set = set(versions_in_range)
+    changelog_paths = _release_notes_changelog_paths(crate_name, versions_in_range)
+    headers = gitlab_api_headers()
+    encoded_repo_path = quote(repo.repo_path, safe="")
+
+    project_url = f"https://gitlab.com/api/v4/projects/{encoded_repo_path}"
+    status, body, final_url, response_headers = await fetch_release_notes_resource(
+        project_url, headers=headers
+    )
+    _record_source_scan(sources_scanned, "gitlab_project", final_url, status)
+    if _is_rate_limited(status, response_headers):
+        warnings.append("rate_limited:gitlab")
+    if status != 200 or body is None:
+        return items
+
+    project_payload = _parse_json_http_payload(body, final_url, response_headers)
+    if not isinstance(project_payload, dict):
+        return items
+
+    project_id = project_payload.get("id")
+    default_branch = project_payload.get("default_branch") or "main"
+    if project_id is None:
+        return items
+
+    project_ref = str(project_id)
+    matched_versions: set[str] = set()
+    if include_release_descriptions:
+        descending_versions = sorted(versions_set, key=_version_sort_key, reverse=True)
+        for version in descending_versions:
+            found_for_version = False
+            for tag in _release_tag_candidates(crate_name, repo.name, version):
+                release_url = (
+                    f"https://gitlab.com/api/v4/projects/{project_ref}/releases/"
+                    f"{quote(tag, safe='')}"
+                )
+                status, body, final_url, response_headers = await fetch_release_notes_resource(
+                    release_url, headers=headers
+                )
+                _record_source_scan(sources_scanned, "gitlab_release_tag", final_url, status)
+                if _is_rate_limited(status, response_headers):
+                    warnings.append("rate_limited:gitlab")
+                    continue
+                if status != 200 or body is None:
+                    continue
+
+                release = _parse_json_http_payload(body, final_url, response_headers)
+                if not isinstance(release, dict):
+                    continue
+                description = str(release.get("description") or "").strip()
+                if not description:
+                    continue
+                release_tag = str(release.get("tag_name") or tag)
+                matched_versions.add(version)
+                web_url = str(
+                    release.get("_links", {}).get("self")
+                    or release.get("url")
+                    or release_url
+                )
+                items.append(
+                    _make_release_note_item(
+                        source_type="gitlab_release",
+                        title=str(release.get("name") or f"Release {release_tag}"),
+                        url=web_url,
+                        content=description,
+                        relevance_score=100,
+                        host="gitlab.com",
+                        repo=repo.repo_path,
+                        path=f"releases/{release_tag}",
+                        selection_reason="exact_tag_match",
+                        published_at=release.get("released_at"),
+                        version_tag=release_tag,
+                    )
+                )
+                found_for_version = True
+                break
+            if found_for_version:
+                continue
+
+        releases_url = (
+            f"https://gitlab.com/api/v4/projects/{project_ref}/releases"
+            f"?per_page={RELEASE_NOTES_MAX_RELEASE_SCAN}"
+        )
+        status, body, final_url, response_headers = await fetch_release_notes_resource(
+            releases_url, headers=headers
+        )
+        _record_source_scan(sources_scanned, "gitlab_releases_list", final_url, status)
+        if _is_rate_limited(status, response_headers):
+            warnings.append("rate_limited:gitlab")
+        if status == 200 and body is not None:
+            releases = _parse_json_http_payload(body, final_url, response_headers)
+            if isinstance(releases, list):
+                for release in releases:
+                    if not isinstance(release, dict):
+                        continue
+                    tag_name = str(release.get("tag_name") or "")
+                    matches, matched_version = _tag_matches_interval(tag_name, versions_set)
+                    if not matches or not matched_version:
+                        continue
+                    if matched_version in matched_versions:
+                        continue
+                    description = str(release.get("description") or "").strip()
+                    if not description:
+                        continue
+                    matched_versions.add(matched_version)
+                    web_url = str(
+                        release.get("_links", {}).get("self")
+                        or release.get("url")
+                        or releases_url
+                    )
+                    items.append(
+                        _make_release_note_item(
+                            source_type="gitlab_release",
+                            title=str(release.get("name") or f"Release {tag_name}"),
+                            url=web_url,
+                            content=description,
+                            relevance_score=85,
+                            host="gitlab.com",
+                            repo=repo.repo_path,
+                            path="releases",
+                            selection_reason="release_list_match",
+                            published_at=release.get("released_at"),
+                            version_tag=tag_name,
+                        )
+                    )
+
+    if include_changelog_files:
+        for changelog_path in changelog_paths:
+            raw_url = (
+                f"https://gitlab.com/api/v4/projects/{project_ref}/repository/files/"
+                f"{quote(changelog_path, safe='')}/raw?ref={quote(default_branch, safe='')}"
+            )
+            status, body, final_url, response_headers = await fetch_release_notes_resource(
+                raw_url, headers=headers
+            )
+            _record_source_scan(sources_scanned, "gitlab_changelog_raw", final_url, status)
+            if _is_rate_limited(status, response_headers):
+                warnings.append("rate_limited:gitlab")
+            if status != 200 or body is None:
+                continue
+
+            markdown = _decode_text_http_payload(body, final_url, response_headers)
+            excerpt, selected_markdown, matched = _extract_relevant_markdown(
+                markdown, versions_set
+            )
+            score = 88 if matched else 55
+            items.append(
+                _make_release_note_item(
+                    source_type="gitlab_changelog_file",
+                    title=changelog_path,
+                    url=raw_url,
+                    content=selected_markdown,
+                    relevance_score=score,
+                    host="gitlab.com",
+                    repo=repo.repo_path,
+                    path=changelog_path,
+                    selection_reason="version_section_match" if matched else "fallback_changelog",
+                )
+            )
+
+    return items
+
+
+def _is_datafusion_family(crate_name: str) -> bool:
+    return crate_name == "datafusion" or crate_name.startswith("datafusion-")
+
+
+def _upgrade_guide_candidate_urls(crate_name: str, crate_meta: dict[str, Any]) -> list[str]:
+    candidates: list[str] = []
+
+    if _is_datafusion_family(crate_name):
+        candidates.extend(
+            [
+                "https://datafusion.apache.org/library-user-guide/upgrading/index.html",
+                "https://datafusion.apache.org/library-user-guide/upgrading/",
+            ]
+        )
+
+    for field in ("homepage", "documentation"):
+        value = crate_meta.get(field)
+        if not isinstance(value, str):
+            continue
+        parsed = urlparse(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            continue
+        base = value.rstrip("/")
+        if any(token in parsed.path.lower() for token in ["upgrade", "migration", "release", "changelog"]):
+            candidates.append(base)
+        for suffix in RELEASE_NOTES_GUIDE_PATHS:
+            candidates.append(urljoin(base + "/", suffix.lstrip("/")))
+
+    return _dedupe_preserve_order(candidates)
+
+
+def _score_upgrade_guide_content(text: str, url: str, versions_in_range: set[str]) -> int:
+    lowered = text.lower()
+    score = 0
+    if any(version.lower() in lowered for version in versions_in_range):
+        score += 70
+    if any(token in lowered for token in ["upgrade", "upgrading", "migration", "breaking"]):
+        score += 30
+    if any(token in url.lower() for token in ["upgrade", "upgrading", "migration", "release", "changelog"]):
+        score += 20
+    return score
+
+
+async def _collect_upgrade_guide_items(
+    crate_name: str,
+    crate_meta: dict[str, Any],
+    versions_in_range: list[str],
+    sources_scanned: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    versions_set = set(versions_in_range)
+
+    for candidate_url in _upgrade_guide_candidate_urls(crate_name, crate_meta):
+        status, body, final_url, response_headers = await fetch_release_notes_resource(
+            candidate_url
+        )
+        _record_source_scan(sources_scanned, "upgrade_guide_lookup", final_url, status)
+        if status != 200 or body is None:
+            continue
+
+        raw_text = _decode_text_http_payload(body, final_url, response_headers)
+        normalized_text = _extract_upgrade_page_text(raw_text)
+
+        is_datafusion_upgrade_root = (
+            _is_datafusion_family(crate_name)
+            and "datafusion.apache.org/library-user-guide/upgrading" in final_url
+        )
+        if is_datafusion_upgrade_root:
+            detailed_items_added = False
+            for detail_url, detail_version, is_exact in _datafusion_upgrade_link_candidates(
+                raw_text, final_url, versions_set
+            ):
+                status2, body2, final_url2, response_headers2 = await fetch_release_notes_resource(
+                    detail_url
+                )
+                _record_source_scan(
+                    sources_scanned,
+                    "upgrade_guide_version_lookup",
+                    final_url2,
+                    status2,
+                )
+                if status2 != 200 or body2 is None:
+                    continue
+                detail_text = _extract_upgrade_page_text(
+                    _decode_text_http_payload(body2, final_url2, response_headers2)
+                )
+                if not detail_text:
+                    continue
+                detail_score = 125 if is_exact else 110
+                items.append(
+                    _make_release_note_item(
+                        source_type="special_case",
+                        title=f"DataFusion upgrade guide {detail_version}",
+                        url=final_url2,
+                        content=detail_text,
+                        relevance_score=detail_score,
+                        host=urlparse(final_url2).netloc,
+                        repo=crate_name,
+                        path=urlparse(final_url2).path,
+                        selection_reason="datafusion_versioned_upgrade_guide",
+                        version_tag=detail_version,
+                    )
+                )
+                detailed_items_added = True
+
+            if detailed_items_added:
+                continue
+
+        score = _score_upgrade_guide_content(normalized_text, final_url, versions_set)
+        if score <= 0:
+            continue
+
+        source_type = (
+            "special_case"
+            if is_datafusion_upgrade_root
+            else "upgrade_guide_page"
+        )
+        selection_reason = (
+            "datafusion_upgrade_guide"
+            if source_type == "special_case"
+            else "deterministic_upgrade_path"
+        )
+        items.append(
+            _make_release_note_item(
+                source_type=source_type,
+                title=f"Upgrade guide: {urlparse(final_url).path or '/'}",
+                url=final_url,
+                content=normalized_text,
+                relevance_score=score,
+                host=urlparse(final_url).netloc,
+                repo=crate_name,
+                path=urlparse(final_url).path,
+                selection_reason=selection_reason,
+            )
+        )
+
+    return items
+
+
+def _release_note_sort_key(item: dict[str, Any]) -> tuple[int, str]:
+    return (
+        -int(item.get("relevance_score", 0)),
+        str(item.get("published_at") or ""),
+    )
+
+
+def _dedupe_release_note_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str | None]] = set()
+    for item in items:
+        key = (
+            str(item.get("source_type")),
+            str(item.get("url")),
+            item.get("version_tag"),
+        )
+        if key in seen:
+            continue
+        deduped.append(item)
+        seen.add(key)
+    return deduped
+
+
+@mcp.tool()
+async def lookup_release_notes(
+    crate_name: str,
+    from_version: str | None = None,
+    to_version: str | None = None,
+    include_upgrade_guides: bool = True,
+    include_release_descriptions: bool = True,
+    include_changelog_files: bool = True,
+    max_items: int = 20,
+    project_dir: str | None = None,
+) -> dict[str, Any]:
+    """Find release notes/changelog/upgrade guidance for a crate across deterministic sources."""
+    bounded_max_items = max(1, min(max_items, RELEASE_NOTES_MAX_ITEMS))
+    cache_key = (
+        crate_name,
+        from_version,
+        to_version,
+        include_upgrade_guides,
+        include_release_descriptions,
+        include_changelog_files,
+        bounded_max_items,
+        project_dir,
+    )
+    cached = _get_cached_dict(_release_notes_result_cache, cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        resolved_from, resolved_to, version_source, versions_in_range, crate_record = (
+            await resolve_release_notes_interval(
+                crate_name=crate_name,
+                from_version=from_version,
+                to_version=to_version,
+                project_dir=project_dir,
+            )
+        )
+        crate_meta = crate_record.get("crate", {}) if isinstance(crate_record, dict) else {}
+        repository_url = crate_meta.get("repository")
+        repo_ref = parse_repository_ref(repository_url)
+
+        sources_scanned: list[dict[str, Any]] = []
+        warnings: list[str] = []
+        items: list[dict[str, Any]] = []
+        release_probe = _new_release_probe()
+        confirmed_tag_urls: list[str] = []
+        available_release_refs: list[dict[str, Any]] = []
+
+        if repo_ref is None:
+            warnings.append("repository_unavailable")
+        elif "github.com" in repo_ref.host:
+            items.extend(
+                await _collect_github_release_items(
+                    crate_name=crate_name,
+                    repo=repo_ref,
+                    versions_in_range=versions_in_range,
+                    include_release_descriptions=include_release_descriptions,
+                    include_changelog_files=include_changelog_files,
+                    sources_scanned=sources_scanned,
+                    warnings=warnings,
+                    release_probe=release_probe,
+                    confirmed_tag_urls=confirmed_tag_urls,
+                    available_release_refs=available_release_refs,
+                )
+            )
+        elif "gitlab.com" in repo_ref.host:
+            items.extend(
+                await _collect_gitlab_release_items(
+                    crate_name=crate_name,
+                    repo=repo_ref,
+                    versions_in_range=versions_in_range,
+                    include_release_descriptions=include_release_descriptions,
+                    include_changelog_files=include_changelog_files,
+                    sources_scanned=sources_scanned,
+                    warnings=warnings,
+                )
+            )
+        else:
+            warnings.append(f"unsupported_repository_host:{repo_ref.host}")
+
+        if include_upgrade_guides:
+            items.extend(
+                await _collect_upgrade_guide_items(
+                    crate_name=crate_name,
+                    crate_meta=crate_meta,
+                    versions_in_range=versions_in_range,
+                    sources_scanned=sources_scanned,
+                )
+            )
+
+        items = _dedupe_release_note_items(items)
+        items.sort(key=_release_note_sort_key)
+        items = items[:bounded_max_items]
+        summary = _build_release_notes_summary(items)
+        source_types = sorted({item["source_type"] for item in items})
+        coverage = {
+            "found_count": len(items),
+            "source_types_found": source_types,
+            "confidence": summary["notes_quality"],
+        }
+
+        warnings = _dedupe_preserve_order(warnings)
+        confirmed_tag_urls = _dedupe_preserve_order(confirmed_tag_urls)
+
+        if not items:
+            error_code = "release_notes_not_found"
+            if any(warning.startswith("rate_limited:") for warning in warnings):
+                error_code = "rate_limited"
+            elif any(warning.startswith("unsupported_repository_host:") for warning in warnings):
+                error_code = "unsupported_repository_host"
+            elif (
+                repo_ref is not None
+                and "github.com" in repo_ref.host
+                and release_probe["release_list_pages_scanned"] > 0
+                and release_probe["release_list_items_seen"] == 0
+                and bool(confirmed_tag_urls)
+            ):
+                error_code = "tags_only_no_release_notes"
+            elif release_probe["empty_release_bodies"] > 0:
+                error_code = "release_objects_without_notes"
+            elif (
+                repo_ref is not None
+                and "github.com" in repo_ref.host
+                and bool(confirmed_tag_urls)
+                and release_probe["release_tag_api_hits"] == 0
+            ):
+                error_code = "release_tag_present_no_release_object"
+
+            result = {
+                "crate": crate_name,
+                "from_version": resolved_from,
+                "to_version": resolved_to,
+                "version_source": version_source,
+                "items": [],
+                "summary": summary,
+                "sources_scanned": sources_scanned,
+                "coverage": coverage,
+                "error": error_code,
+                "message": "No release notes or upgrade guides found for this version interval",
+                "context": {
+                    "classification": error_code,
+                    "missing_reasons": warnings,
+                    "versions_in_range": versions_in_range,
+                    "repository": repository_url,
+                    "confirmed_tag_urls": confirmed_tag_urls,
+                    "release_probe": release_probe,
+                    "available_release_refs": available_release_refs,
+                },
+            }
+            _set_cached_dict(_release_notes_result_cache, cache_key, result)
+            return result
+
+        result = {
+            "crate": crate_name,
+            "from_version": resolved_from,
+            "to_version": resolved_to,
+            "version_source": version_source,
+            "items": items,
+            "summary": summary,
+            "sources_scanned": sources_scanned,
+            "coverage": coverage,
+            "context": {
+                "missing_reasons": warnings,
+                "versions_in_range": versions_in_range,
+                "repository": repository_url,
+            }
+            if warnings
+            else None,
+        }
+        _set_cached_dict(_release_notes_result_cache, cache_key, result)
+        return result
+
+    except DataError as exc:
+        return {
+            "crate": crate_name,
+            "from_version": from_version,
+            "to_version": to_version,
+            "version_source": "unknown",
+            "items": [],
+            "summary": {
+                "breaking_changes": [],
+                "migration_steps": [],
+                "deprecations": [],
+                "new_features": [],
+                "notes_quality": "low",
+            },
+            "sources_scanned": [],
+            "coverage": {"found_count": 0, "source_types_found": [], "confidence": "low"},
+            "error": exc.code,
+            "message": exc.message,
+            "context": exc.context,
+        }
+    except Exception as exc:
+        return {
+            "crate": crate_name,
+            "from_version": from_version,
+            "to_version": to_version,
+            "version_source": "unknown",
+            "items": [],
+            "summary": {
+                "breaking_changes": [],
+                "migration_steps": [],
+                "deprecations": [],
+                "new_features": [],
+                "notes_quality": "low",
+            },
+            "sources_scanned": [],
+            "coverage": {"found_count": 0, "source_types_found": [], "confidence": "low"},
+            "error": "unexpected_error",
+            "message": str(exc),
+        }
+
+
+def _workspace_dependency_inventory(manifest_paths: list[str]) -> dict[str, dict[str, Any]]:
+    inventory: dict[str, dict[str, Any]] = {}
+    for manifest in manifest_paths:
+        path = Path(manifest)
+        if not path.exists():
+            continue
+        try:
+            with open(path, "rb") as f:
+                data = tomllib.load(f)
+        except Exception:
+            continue
+
+        deps = data.get("workspace", {}).get("dependencies", {})
+        if not isinstance(deps, dict):
+            continue
+
+        for dep_name, dep_spec in deps.items():
+            source = "registry"
+            version = None
+            if isinstance(dep_spec, str):
+                version = dep_spec
+            elif isinstance(dep_spec, dict):
+                version = dep_spec.get("version")
+                if "git" in dep_spec:
+                    source = "git"
+                elif "path" in dep_spec:
+                    source = "path"
+            else:
+                continue
+
+            row = inventory.setdefault(
+                dep_name,
+                {
+                    "name": dep_name,
+                    "source": source,
+                    "versions": set(),
+                    "declared_in": set(),
+                },
+            )
+            row["source"] = source if source != "registry" else row["source"]
+            if isinstance(version, str):
+                row["versions"].add(version)
+            row["declared_in"].add(str(path))
+
+    for row in inventory.values():
+        row["versions"] = sorted(row["versions"], key=_version_sort_key)
+        row["declared_in"] = sorted(row["declared_in"])
+    return inventory
+
+
+def _inventory_source_kind(source: str | None) -> str:
+    if source is None:
+        return "unknown"
+    lowered = source.lower()
+    if lowered == "workspace":
+        return "registry"
+    if lowered.startswith("registry:") or lowered.startswith("registry+"):
+        return "registry"
+    if lowered.startswith("git:") or lowered.startswith("git+"):
+        return "git"
+    if lowered.startswith("path:"):
+        return "path"
+    return "unknown"
+
+
+def _direct_dependency_inventory(
+    manifest_paths: list[str],
+    include_workspace_members: bool,
+    include_dev: bool,
+) -> dict[str, dict[str, Any]]:
+    inventory: dict[str, dict[str, Any]] = {}
+    seen_manifests: set[Path] = set()
+
+    for manifest in manifest_paths:
+        root_manifest = Path(manifest)
+        if not root_manifest.exists():
+            continue
+
+        candidate_manifests = [root_manifest]
+        if include_workspace_members:
+            discovered = discover_project_manifests(root_manifest.parent, True)
+            if discovered:
+                candidate_manifests = discovered
+
+        for manifest_path in candidate_manifests:
+            manifest_path = manifest_path.resolve()
+            if manifest_path in seen_manifests:
+                continue
+            seen_manifests.add(manifest_path)
+
+            try:
+                with open(manifest_path, "rb") as f:
+                    manifest_data = tomllib.load(f)
+            except Exception:
+                continue
+
+            project_root = manifest_path.parent
+            entries = _collect_direct_dependencies_from_manifest(
+                manifest_data=manifest_data,
+                manifest_path=manifest_path,
+                project_dir=project_root,
+                include_dev=include_dev,
+            )
+            for entry in entries:
+                name = entry["name"]
+                source_kind = _inventory_source_kind(entry.get("source"))
+                row = inventory.setdefault(
+                    name,
+                    {
+                        "name": name,
+                        "source": source_kind,
+                        "versions": set(),
+                        "declared_in": set(),
+                        "sources": set(),
+                    },
+                )
+                if source_kind != "registry":
+                    row["source"] = source_kind
+                requested_version = entry.get("requested_version")
+                if isinstance(requested_version, str):
+                    row["versions"].add(requested_version)
+                row["declared_in"].add(str(manifest_path))
+                if entry.get("source"):
+                    row["sources"].add(str(entry["source"]))
+
+    workspace_inventory = _workspace_dependency_inventory(manifest_paths)
+    for name, ws_row in workspace_inventory.items():
+        source_kind = _inventory_source_kind(ws_row.get("source"))
+        row = inventory.setdefault(
+            name,
+            {
+                "name": name,
+                "source": source_kind,
+                "versions": set(),
+                "declared_in": set(),
+                "sources": set(),
+            },
+        )
+        if source_kind != "registry":
+            row["source"] = source_kind
+        for version in ws_row.get("versions", []):
+            if isinstance(version, str):
+                row["versions"].add(version)
+        for declared in ws_row.get("declared_in", []):
+            if isinstance(declared, str):
+                row["declared_in"].add(declared)
+
+    for row in inventory.values():
+        row["versions"] = sorted(row["versions"], key=_version_sort_key)
+        row["declared_in"] = sorted(row["declared_in"])
+        row["sources"] = sorted(row["sources"])
+    return inventory
+
+
+def _lockfile_dependency_inventory(project_dir: Path) -> dict[str, dict[str, Any]]:
+    lock_path = project_dir / "Cargo.lock"
+    versions, packages = parse_cargo_lock(lock_path)
+
+    inventory: dict[str, dict[str, Any]] = {}
+    for package in packages:
+        name = package.get("name")
+        version = package.get("version")
+        source = package.get("source")
+        if not isinstance(name, str) or not isinstance(version, str):
+            continue
+
+        source_kind = _inventory_source_kind(source)
+        row = inventory.setdefault(
+            name,
+            {
+                "name": name,
+                "source": source_kind,
+                "versions": set(),
+                "declared_in": {str(lock_path)},
+                "sources": set(),
+            },
+        )
+        if source_kind != "registry":
+            row["source"] = source_kind
+        row["versions"].add(version)
+        if isinstance(source, str):
+            row["sources"].add(source)
+
+    for name, row in inventory.items():
+        row["versions"] = versions.get(name, sorted(row["versions"], key=_version_sort_key))
+        row["declared_in"] = sorted(row["declared_in"])
+        row["sources"] = sorted(row["sources"])
+    return inventory
+
+
+@mcp.tool()
+async def research_release_notes_coverage(
+    manifest_paths: list[str] | None = None,
+    max_crates: int = 0,
+    project_dir: str | None = None,
+    include_transitive: bool = False,
+    include_workspace_members: bool = True,
+    include_dev: bool = True,
+) -> dict[str, Any]:
+    """Run deterministic source-availability research across workspace dependency manifests."""
+    manifests = manifest_paths or RELEASE_NOTES_SCAN_MANIFESTS
+    scan_mode = "lockfile_full" if include_transitive else "direct_manifest"
+    truncated = False
+    truncation_reason: str | None = None
+
+    if include_transitive:
+        if project_dir:
+            resolved_project_dir = Path(project_dir).resolve()
+        elif _project_dir is not None:
+            resolved_project_dir = _project_dir
+        else:
+            return {
+                "manifest_paths": manifests,
+                "scan_mode": scan_mode,
+                "truncated": False,
+                "truncation_reason": None,
+                "total_crates": 0,
+                "results": [],
+                "summary": {
+                    "found": 0,
+                    "unsupported": 0,
+                    "not_found": 0,
+                    "rate_limited": 0,
+                },
+                "error": "project_dir_required",
+                "message": "include_transitive=true requires project_dir or server --project-dir",
+            }
+
+        lock_path = resolved_project_dir / "Cargo.lock"
+        if not lock_path.exists():
+            return {
+                "manifest_paths": manifests,
+                "scan_mode": scan_mode,
+                "truncated": False,
+                "truncation_reason": None,
+                "total_crates": 0,
+                "results": [],
+                "summary": {
+                    "found": 0,
+                    "unsupported": 0,
+                    "not_found": 0,
+                    "rate_limited": 0,
+                },
+                "error": "cargo_lock_not_found",
+                "message": f"Cargo.lock not found at {lock_path}",
+            }
+        inventory = _lockfile_dependency_inventory(resolved_project_dir)
+    else:
+        inventory = _direct_dependency_inventory(
+            manifests,
+            include_workspace_members=include_workspace_members,
+            include_dev=include_dev,
+        )
+
+    crates = sorted(inventory.values(), key=lambda row: row["name"])
+    if max_crates > 0:
+        crates = crates[:max_crates]
+
+    per_crate: list[dict[str, Any]] = []
+    found = 0
+    unsupported = 0
+    not_found = 0
+    rate_limited = 0
+
+    rate_limited_hits = 0
+
+    async def evaluate_crate(crate: dict[str, Any]) -> dict[str, Any]:
+        name = crate["name"]
+        selected_version = select_preferred_version(crate.get("versions", []))
+        result = await lookup_release_notes(
+            name,
+            from_version=selected_version,
+            to_version=selected_version,
+            max_items=3,
+            project_dir=project_dir,
+        )
+        return {
+            "crate": crate,
+            "lookup_result": result,
+            "selected_version": selected_version,
+        }
+
+    registry_crates: list[dict[str, Any]] = []
+    for crate in crates:
+        name = crate["name"]
+        if crate["source"] != "registry":
+            per_crate.append(
+                {
+                    "crate": name,
+                    "source": crate["source"],
+                    "error": "repository_unavailable",
+                    "message": "Non-registry dependency source",
+                    "declared_in": crate["declared_in"],
+                    "sources": crate.get("sources", []),
+                }
+            )
+            unsupported += 1
+            continue
+        registry_crates.append(crate)
+
+    for start in range(0, len(registry_crates), RELEASE_NOTES_RESEARCH_CONCURRENCY):
+        if rate_limited_hits >= RELEASE_NOTES_RESEARCH_RATE_LIMIT_THRESHOLD:
+            truncated = True
+            truncation_reason = (
+                f"Stopped after {rate_limited_hits} rate-limited lookups "
+                f"(threshold={RELEASE_NOTES_RESEARCH_RATE_LIMIT_THRESHOLD})"
+            )
+            break
+
+        chunk = registry_crates[start : start + RELEASE_NOTES_RESEARCH_CONCURRENCY]
+        payloads = await asyncio.gather(*(evaluate_crate(crate) for crate in chunk))
+        for payload in payloads:
+            crate = payload["crate"]
+            name = crate["name"]
+            result = payload["lookup_result"]
+            selected_version = payload["selected_version"]
+            found_count = (result.get("coverage") or {}).get("found_count", 0)
+            error = result.get("error")
+            if found_count:
+                found += 1
+            elif error == "unsupported_repository_host":
+                unsupported += 1
+            elif error == "rate_limited":
+                rate_limited += 1
+                rate_limited_hits += 1
+            else:
+                not_found += 1
+
+            per_crate.append(
+                {
+                    "crate": name,
+                    "source": crate["source"],
+                    "declared_in": crate["declared_in"],
+                    "requested_versions": crate["versions"],
+                    "selected_version": selected_version,
+                    "error": error,
+                    "coverage": result.get("coverage"),
+                    "source_types_found": (
+                        result.get("coverage") or {}
+                    ).get("source_types_found", []),
+                    "missing_reasons": (result.get("context") or {}).get("missing_reasons", []),
+                }
+            )
+            if rate_limited_hits >= RELEASE_NOTES_RESEARCH_RATE_LIMIT_THRESHOLD:
+                truncated = True
+                truncation_reason = (
+                    f"Stopped after {rate_limited_hits} rate-limited lookups "
+                    f"(threshold={RELEASE_NOTES_RESEARCH_RATE_LIMIT_THRESHOLD})"
+                )
+                break
+        if truncated:
+            break
+
+    return {
+        "manifest_paths": manifests,
+        "scan_mode": scan_mode,
+        "truncated": truncated,
+        "truncation_reason": truncation_reason,
+        "total_crates": len(crates),
+        "results": per_crate,
+        "summary": {
+            "found": found,
+            "unsupported": unsupported,
+            "not_found": not_found,
+            "rate_limited": rate_limited,
+        },
+    }
 
 
 @mcp.tool()
@@ -3157,6 +5301,9 @@ def main() -> None:
     args = parser.parse_args()
 
     _project_dir = Path(args.project_dir).resolve() if args.project_dir else None
+
+    # Best-effort startup bootstrap for authenticated GitHub API requests.
+    bootstrap_github_token_from_gh_cli()
 
     if _project_dir:
         cargo_lock_path = _project_dir / "Cargo.lock"

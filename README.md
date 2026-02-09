@@ -18,6 +18,7 @@ This MCP server enables AI assistants to browse and search Rust crate documentat
 - Looking up compact item signatures
 - Inspecting crate feature-flag graphs
 - Listing project crates from Cargo manifests and Cargo.lock
+- Looking up release notes, changelogs, and upgrade guides
 - Exploring module hierarchies
 - Comparing API changes between versions
 
@@ -34,6 +35,7 @@ This MCP server enables AI assistants to browse and search Rust crate documentat
 - **Item Signatures**: Fetch compact structured signatures without full-page markdown
 - **Feature Flag Analysis**: Extract feature graph, defaults, and optional dependency flags
 - **Project Crate Inventory**: List direct and transitive crates for the configured project
+- **Release Notes Lookup**: Aggregate release notes/changelog/upgrade guides for dependency upgrades
 - **Module Hierarchy**: Explore the complete module structure of a crate
 - **Version Comparison**: Compare API surface or content between different versions
 - **Smart Pagination**: Character-based pagination for handling large documentation
@@ -220,6 +222,63 @@ List direct and transitive crates for the configured `--project-dir`.
 - `project_dir`, `cargo_lock_loaded`
 - `direct_crates`, `transitive_crates`, `unresolved_direct`
 - `counts`
+
+### lookup_release_notes
+
+Find release notes, changelog sections, and upgrade guides for a crate/version interval.
+
+**Parameters:**
+- `crate_name` (required): Crate name
+- `from_version` (optional): Lower bound version (inclusive)
+- `to_version` (optional): Upper bound version (inclusive)
+- `include_upgrade_guides` (optional): Include docs/homepage upgrade guides (default: true)
+- `include_release_descriptions` (optional): Include hosted release descriptions (default: true)
+- `include_changelog_files` (optional): Include changelog/migration files from repo (default: true)
+- `max_items` (optional): Maximum items to return (default: 20, max: 100)
+- `project_dir` (optional): Override Cargo.lock source used for `to_version` resolution
+
+**Response fields:**
+- `crate`, `from_version`, `to_version`, `version_source`
+- `items`: normalized items with `source_type`, `title`, `url`, `published_at`, `version_tag`, `content_excerpt`, `content_markdown`, `relevance_score`, `provenance`
+- `summary`: `breaking_changes`, `migration_steps`, `deprecations`, `new_features`, `notes_quality`
+- `sources_scanned`, `coverage`
+- `error` (when no items): may be `release_notes_not_found`, `tags_only_no_release_notes`, `release_tag_present_no_release_object`, `release_objects_without_notes`, `rate_limited`, `unsupported_repository_host`
+
+**Notes:**
+- Best-effort coverage: some crates do not publish release notes/changelogs.
+- Supported repository hosts in v1: GitHub and GitLab.
+- Optional auth tokens improve reliability for API rate limits:
+  - `GITHUB_TOKEN` or `GH_TOKEN`
+- `GITLAB_TOKEN`
+- Startup convenience: if GitHub token env vars are unset and `gh` is installed/authenticated, the server automatically tries `gh auth token` once at startup.
+- Recommended upgrade workflow: combine `compare_versions` (API/doc diffs) with `lookup_release_notes` (human-authored migration guidance).
+- Empty-result diagnostics include:
+  - `context.classification`
+  - `context.confirmed_tag_urls`
+  - `context.release_probe` (`release_list_pages_scanned`, `release_list_items_seen`, `release_tag_api_hits`, `release_tag_api_404`, `empty_release_bodies`)
+  - `context.available_release_refs` (found tags/releases without note body)
+
+### research_release_notes_coverage
+
+Run deterministic source-availability research for workspace dependencies in one or more manifests.
+
+**Parameters:**
+- `manifest_paths` (optional): List of `Cargo.toml` files. Defaults to:
+  - `/Users/jmease/repos/vl-convert/Cargo.toml`
+  - `/Users/jmease/repos/vegafusion/Cargo.toml`
+  - `/Users/jmease/repos/avenger/Cargo.toml`
+- `max_crates` (optional): Limit crates analyzed (0 means all)
+- `project_dir` (optional): Project root containing `Cargo.lock`; used by transitive scan mode
+- `include_transitive` (optional): Scan lockfile-resolved transitive crates (default: false)
+- `include_workspace_members` (optional): Include workspace member manifests for direct mode (default: true)
+- `include_dev` (optional): Include dev-dependencies in direct mode (default: true)
+
+**Response fields:**
+- `manifest_paths`, `total_crates`
+- `scan_mode`: `direct_manifest` or `lockfile_full`
+- `truncated`, `truncation_reason`
+- `results` per crate with coverage/error metadata
+- `summary` counts (`found`, `unsupported`, `not_found`, `rate_limited`)
 
 ### search_docs
 
