@@ -15,6 +15,9 @@ This MCP server enables AI assistants to browse and search Rust crate documentat
 - Extracting code examples from documentation
 - Finding trait implementors
 - Analyzing crate dependencies
+- Looking up compact item signatures
+- Inspecting crate feature-flag graphs
+- Listing project crates from Cargo manifests and Cargo.lock
 - Exploring module hierarchies
 - Comparing API changes between versions
 
@@ -28,12 +31,15 @@ This MCP server enables AI assistants to browse and search Rust crate documentat
 - **Code Example Extraction**: Extract and filter code examples from documentation
 - **Trait Analysis**: Find all types that implement a specific trait
 - **Dependency Analysis**: Analyze and extract crate dependencies from documentation
+- **Item Signatures**: Fetch compact structured signatures without full-page markdown
+- **Feature Flag Analysis**: Extract feature graph, defaults, and optional dependency flags
+- **Project Crate Inventory**: List direct and transitive crates for the configured project
 - **Module Hierarchy**: Explore the complete module structure of a crate
 - **Version Comparison**: Compare API surface or content between different versions
 - **Smart Pagination**: Character-based pagination for handling large documentation
 - **Link Extraction**: Automatically extract and convert links to navigation keys
 - **Version Control**: Support for specific crate versions or default to latest
-- **HTML to Markdown**: Clean markdown output for better readability
+- **Rustdoc JSON Native**: Uses docs.rs rustdoc JSON and crates.io APIs with no HTML fallback
 
 ## Installation
 
@@ -49,6 +55,9 @@ uv pip install -e .
 
 # Run the server
 uv run jons-mcp-docs-rs
+
+# Optional: load Cargo.lock and Cargo.toml metadata from a project
+uv run jons-mcp-docs-rs --project-dir /path/to/rust/project
 ```
 
 ### Using pip
@@ -74,7 +83,7 @@ jons-mcp-docs-rs
 Add this server to Claude Desktop by running:
 
 ```bash
-claude mcp add jons-mcp-docs-rs uvx -- --from git+https://github.com/jonmmease/jons-mcp-docs.rs jons-mcp-docs-rs
+claude mcp add jons-mcp-docs-rs uvx -- --from git+https://github.com/jonmmease/jons-mcp-docs.rs jons-mcp-docs-rs --project-dir /path/to/rust/project
 ```
 
 ## Tools
@@ -88,6 +97,8 @@ Fetch the main documentation page for a Rust crate.
 - `version` (optional): The version to look up (defaults to "latest")
 - `offset` (optional): Character offset for pagination (default: 0)
 - `limit` (optional): Maximum number of characters to return (default: 50)
+- `target` (optional): Rust target triple for rustdoc JSON selection
+- `rustdoc_format` (optional): Pin rustdoc JSON format version
 
 **Example:**
 ```json
@@ -130,6 +141,8 @@ Fetch one or more specific documentation pages.
 - `version` (optional): Override version for all pages
 - `offset` (optional): Character offset for combined pagination (default: 0)
 - `limit` (optional): Maximum characters to return across all pages (default: 50)
+- `target` (optional): Rust target triple for rustdoc JSON selection
+- `rustdoc_format` (optional): Pin rustdoc JSON format version
 
 **Example:**
 ```json
@@ -166,6 +179,48 @@ Fetch one or more specific documentation pages.
 
 **Note**: The `source_available` field indicates whether source code can be viewed for this item using the `get_source_code` tool.
 
+### lookup_item_signature
+
+Fetch a compact, structured signature for a single item.
+
+**Parameters:**
+- `item` (required): docs key, `docs.rs://...`, or `https://docs.rs/...`
+- `version` (optional): Override item version
+- `include_members` (optional): Include methods/associated items for trait/impl sections
+- `member_limit` (optional): Max members to return (default: 20, max: 100)
+
+**Response fields:**
+- `item_key`, `resolved_url`, `kind`, `name`
+- `signature`, `where_clause`, `generics`
+- `members`, `version_source`
+
+### lookup_feature_flags
+
+Fetch feature-flag graph data for a crate.
+
+**Parameters:**
+- `crate_name` (required): The crate name
+- `version` (optional): Version to inspect
+
+**Response fields:**
+- `crate`, `version`, `version_source`
+- `features`: feature list with `name`, `enables`, `enabled_by`, `is_default`
+- `default_features`, `optional_dependencies`, `feature_count`, `source_url`
+
+### list_project_crates
+
+List direct and transitive crates for the configured `--project-dir`.
+
+**Parameters:**
+- `include_transitive` (optional): Include lockfile transitives (default: true)
+- `include_workspace_members` (optional): Include workspace member manifests (default: true)
+- `include_dev` (optional): Include dev dependencies in direct classification (default: true)
+
+**Response fields:**
+- `project_dir`, `cargo_lock_loaded`
+- `direct_crates`, `transitive_crates`, `unresolved_direct`
+- `counts`
+
 ### search_docs
 
 Search within a crate's documentation.
@@ -176,6 +231,8 @@ Search within a crate's documentation.
 - `version` (optional): The version to search (defaults to "latest")
 - `offset` (optional): Result offset for pagination (default: 0)
 - `limit` (optional): Maximum number of results to return (default: 50)
+- `target` (optional): Rust target triple for rustdoc JSON selection
+- `rustdoc_format` (optional): Pin rustdoc JSON format version
 
 **Example:**
 ```json
@@ -206,13 +263,13 @@ Search within a crate's documentation.
   "offset": 0,
   "limit": 10,
   "has_more": true,
-  "search_url": "https://docs.rs/datafusion/latest/datafusion/?search=udf"
+  "search_url": "https://docs.rs/crate/datafusion/latest/json.gz"
 }
 ```
 
 ### search_crates
 
-Search for Rust crates by name on docs.rs.
+Search for Rust crates by name using the crates.io API.
 
 **Parameters:**
 - `query` (required): The search query for crate names
@@ -242,18 +299,20 @@ Search for Rust crates by name on docs.rs.
   ],
   "total_on_page": 30,
   "has_next_page": true,
-  "search_url": "https://docs.rs/releases/search?query=serde"
+  "search_url": "https://crates.io/api/v1/crates?q=serde&page=1&per_page=30"
 }
 ```
 
 ### get_source_code
 
-Get the source code for a Rust item from the source viewer.
+Get source code using rustdoc JSON spans and crates.io crate archives.
 
 **Parameters:**
 - `page_key` (required): The page key for the item (e.g., "tokio/latest/tokio/runtime/struct.Runtime")
 - `offset` (optional): Character offset for pagination (default: 0)
 - `limit` (optional): Maximum number of characters to return (default: 50)
+- `target` (optional): Rust target triple for rustdoc JSON selection
+- `rustdoc_format` (optional): Pin rustdoc JSON format version
 
 **Example:**
 ```json
@@ -267,13 +326,18 @@ Get the source code for a Rust item from the source viewer.
 **Response:**
 ```json
 {
-  "page_key": "datafusion/latest/datafusion/logical_expr/trait.ScalarUDFImpl",
-  "source_code": "pub trait ScalarUDFImpl: Debug + Send + Sync {\n    ...",
+  "key": "datafusion/latest/datafusion/logical_expr/trait.ScalarUDFImpl",
+  "content": "pub trait ScalarUDFImpl: Debug + Send + Sync {\n    ...",
   "total_characters": 5000,
   "offset": 0,
   "limit": 2000,
   "has_more": true,
-  "url": "https://docs.rs/datafusion/latest/src/datafusion/logical_expr/udf.rs.html#123"
+  "source_url": "https://docs.rs/crate/datafusion/latest/source/src/logical_expr/udf.rs",
+  "span": {
+    "filename": "src/logical_expr/udf.rs",
+    "begin": [120, 1],
+    "end": [200, 2]
+  }
 }
 ```
 
@@ -283,9 +347,12 @@ Extract code examples from documentation.
 
 **Parameters:**
 - `crate_name` (required): The name of the crate
-- `search_pattern` (optional): Pattern to search for in examples (e.g., "DataFrame")
+- `module_path` (optional): Limit extraction to a module subtree
+- `filter_text` (optional): Filter examples by code text
+- `only_complete` (optional): Keep only complete Rust examples
 - `version` (optional): Version of the crate (defaults to "latest")
-- `max_examples` (optional): Maximum number of examples to return (default: 10)
+- `target` (optional): Rust target triple for rustdoc JSON selection
+- `rustdoc_format` (optional): Pin rustdoc JSON format version
 
 **Example:**
 ```json
@@ -310,7 +377,7 @@ Extract code examples from documentation.
       "context": "Creating a new SessionContext"
     }
   ],
-  "total_examples": 5
+  "total_found": 5
 }
 ```
 
@@ -322,6 +389,8 @@ Find types that implement a specific trait.
 - `crate_name` (required): The name of the crate containing the trait
 - `trait_path` (required): Path to the trait (e.g., "prelude/trait.Debug")
 - `version` (optional): Version of the crate (defaults to "latest")
+- `target` (optional): Rust target triple for rustdoc JSON selection
+- `rustdoc_format` (optional): Pin rustdoc JSON format version
 
 **Example:**
 ```json
@@ -376,16 +445,23 @@ Analyze a crate's dependencies from its documentation.
     "direct": [
       {
         "name": "mio",
-        "url": "https://docs.rs/mio",
-        "context": "Event notification library"
+        "version_req": "^1.0.1",
+        "optional": true,
+        "url": "https://docs.rs/mio"
       }
     ],
+    "dev": [],
+    "build": [],
     "features": [
       {
         "name": "full",
-        "dependencies": ["rt", "macros", "sync", "time"]
+        "enables": ["rt", "macros", "sync", "time"],
+        "enabled_by": [],
+        "is_default": false
       }
     ],
+    "default_features": ["rt", "macros"],
+    "optional_dependencies": ["mio"],
     "total": 15
   }
 }
@@ -400,6 +476,8 @@ Get the module structure and hierarchy of a crate.
 - `start_module` (optional): Starting module path (defaults to root)
 - `max_depth` (optional): Maximum depth to traverse (default: 3)
 - `version` (optional): Version of the crate (defaults to "latest")
+- `target` (optional): Rust target triple for rustdoc JSON selection
+- `rustdoc_format` (optional): Pin rustdoc JSON format version
 
 **Example:**
 ```json
@@ -450,6 +528,8 @@ Compare documentation between two versions of a crate.
 - `version2` (required): Second version to compare
 - `page_path` (optional): Specific page to compare (for full_content comparison)
 - `comparison_type` (optional): "api_surface" (default) or "full_content"
+- `target` (optional): Rust target triple for rustdoc JSON selection
+- `rustdoc_format` (optional): Pin rustdoc JSON format version
 
 **Example (API Surface Comparison):**
 ```json
@@ -784,9 +864,9 @@ ruff check src tests
 The server is built with:
 
 - **FastMCP**: Framework for building MCP servers
-- **httpx**: Async HTTP client for fetching documentation
-- **html2text**: Converting HTML to clean markdown
-- **BeautifulSoup4**: HTML parsing for link extraction
+- **httpx**: Async HTTP client for docs.rs/crates.io APIs
+- **docs.rs rustdoc JSON**: Structured API docs and item graph
+- **crates.io API + crate archives**: Metadata, dependencies, features, and source extraction
 
 Key design decisions:
 
