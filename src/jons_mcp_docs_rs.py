@@ -4667,6 +4667,50 @@ def _type_target_from_impl(snapshot: RustdocSnapshot, impl_data: dict[str, Any])
     return None, name
 
 
+def _trait_info_from_impl(
+    snapshot: RustdocSnapshot, impl_data: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Extract trait info from an impl item's data.
+
+    The ``trait`` field on an impl is a bare Path
+    (``{"path": "Debug", "id": 999, "args": null}``), NOT a Type wrapper.
+    Returns ``None`` for inherent impls (where ``trait`` is null).
+    """
+    trait_path_obj = impl_data.get("trait")
+    if trait_path_obj is None:
+        return None
+
+    if not isinstance(trait_path_obj, dict):
+        return None
+
+    trait_name = trait_path_obj.get("path", "")
+    trait_id = trait_path_obj.get("id")
+    trait_args = render_generic_args(trait_path_obj.get("args"))
+
+    trait_key = None
+    if trait_id is not None:
+        key, _ = _link_target_from_id(snapshot, str(trait_id))
+        trait_key = key
+
+    is_blanket = impl_data.get("blanket_impl") is not None
+    is_synthetic = impl_data.get("is_synthetic", False)
+    is_negative = impl_data.get("is_negative", False)
+    is_unsafe = impl_data.get("is_unsafe", False)
+
+    method_ids = impl_data.get("items", [])
+    method_count = len(method_ids) if isinstance(method_ids, list) else 0
+
+    return {
+        "trait_name": f"{trait_name}{trait_args}",
+        "trait_key": trait_key,
+        "is_blanket": is_blanket,
+        "is_synthetic": is_synthetic,
+        "is_negative": is_negative,
+        "is_unsafe": is_unsafe,
+        "method_count": method_count,
+    }
+
+
 @mcp.tool()
 async def find_trait_implementors(
     crate_name: str,
@@ -4675,7 +4719,10 @@ async def find_trait_implementors(
     target: str | None = None,
     rustdoc_format: int | None = None,
 ) -> dict[str, Any]:
-    """Find implementors for a trait using rustdoc JSON trait implementation ids."""
+    """Find implementors for a trait using rustdoc JSON trait implementation ids.
+
+    See also: lookup_type_trait_impls for the inverse operation (type -> traits).
+    """
     try:
         snapshot = await get_rustdoc_snapshot(crate_name, version, target, rustdoc_format)
         trait_local_key = _resolve_trait_local_key(crate_name, trait_path)
@@ -4762,6 +4809,122 @@ async def find_trait_implementors(
         return {
             "crate": crate_name,
             "trait_path": trait_path,
+            "error": "unexpected_error",
+            "message": str(exc),
+        }
+
+
+@mcp.tool()
+async def lookup_type_trait_impls(
+    item: str,
+    version: str | None = None,
+    target: str | None = None,
+    rustdoc_format: int | None = None,
+) -> dict[str, Any]:
+    """Look up all trait implementations for a Rust type (struct, enum, or union).
+
+    The inverse of find_trait_implementors: given a type, discover what traits
+    it implements. Returns direct trait impls, auto-traits (Send, Sync, Unpin),
+    and blanket impls separately.
+
+    Use this when you need to understand a type's capabilities, check if it
+    implements a specific trait, or discover available methods from trait impls.
+
+    The item parameter accepts the same formats as lookup_item_signature:
+    - docs.rs:// protocol: "docs.rs://tokio/latest/tokio/runtime/struct.Runtime"
+    - Full URL: "https://docs.rs/tokio/latest/tokio/runtime/struct.Runtime.html"
+    - Key path: "tokio/latest/tokio/runtime/struct.Runtime"
+    """
+    try:
+        normalized_item = normalize_item_to_key(item)
+        resolved_key, version_source = resolve_item_key_and_version_source(
+            normalized_item, version
+        )
+        crate_name, resolved_version, local_key = parse_absolute_item_key(resolved_key)
+        snapshot = await get_rustdoc_snapshot(
+            crate_name, resolved_version, target, rustdoc_format
+        )
+
+        item_id = _item_id_from_local_key(snapshot, local_key)
+        rustdoc_item = snapshot.index[item_id]
+        kind = inner_kind(rustdoc_item)
+
+        if kind not in ("struct", "enum", "union"):
+            raise DataError(
+                "rustdoc_item_not_a_type",
+                f"Item is a {normalize_kind(kind)}, not a struct/enum/union. "
+                "Only types with impl blocks are supported.",
+                context={"item_key": local_key, "actual_kind": normalize_kind(kind)},
+            )
+
+        kind_data = rustdoc_item.get("inner", {}).get(kind, {})
+        impl_ids = [str(v) for v in (kind_data.get("impls") or [])]
+
+        trait_impls: list[dict[str, Any]] = []
+        auto_traits: list[str] = []
+        blanket_impls: list[dict[str, Any]] = []
+        inherent_impl_count = 0
+
+        for impl_id in impl_ids:
+            impl_item = snapshot.index.get(impl_id)
+            if not isinstance(impl_item, dict):
+                continue
+            impl_data = impl_item.get("inner", {}).get("impl", {})
+            if not isinstance(impl_data, dict):
+                continue
+
+            info = _trait_info_from_impl(snapshot, impl_data)
+            if info is None:
+                inherent_impl_count += 1
+                continue
+
+            if info["is_synthetic"]:
+                label = info["trait_name"]
+                if info["is_negative"]:
+                    label = f"!{label}"
+                auto_traits.append(label)
+            elif info["is_blanket"]:
+                blanket_impls.append({
+                    "trait_name": info["trait_name"],
+                    "trait_key": info["trait_key"],
+                })
+            else:
+                trait_impls.append(info)
+
+        name = rustdoc_item.get("name") or local_key.split("/")[-1]
+
+        return {
+            "item_key": f"{snapshot.crate_name}/{snapshot.version}/{local_key}",
+            "kind": normalize_kind(kind),
+            "name": name,
+            "crate": snapshot.crate_name,
+            "version": snapshot.version,
+            "version_source": version_source,
+            "trait_impls": trait_impls,
+            "auto_traits": sorted(auto_traits),
+            "blanket_impls": blanket_impls,
+            "direct_count": len(trait_impls),
+            "auto_count": len(auto_traits),
+            "blanket_count": len(blanket_impls),
+            "inherent_impl_count": inherent_impl_count,
+            "total_impl_count": len(impl_ids),
+            "format_version": snapshot.format_version,
+            "target_triple": snapshot.target_triple,
+            "deprecation": _deprecation_payload(rustdoc_item),
+        }
+
+    except DataError as exc:
+        normalized = normalize_item_to_key(item)
+        return {
+            "item_key": normalized,
+            "error": exc.code,
+            "message": exc.message,
+            "context": exc.context,
+        }
+    except Exception as exc:
+        normalized = normalize_item_to_key(item)
+        return {
+            "item_key": normalized,
             "error": "unexpected_error",
             "message": str(exc),
         }

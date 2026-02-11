@@ -22,6 +22,7 @@ from src.jons_mcp_docs_rs import (
     lookup_item_signature,
     lookup_pages,
     lookup_release_notes,
+    lookup_type_trait_impls,
     normalize_crate_path,
     normalize_item_to_key,
     paginate_content,
@@ -868,3 +869,187 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         assert result["scan_mode"] == "lockfile_full"
         assert result["summary"]["found"] == 1
         assert result["summary"]["unsupported"] == 1
+
+    async def test_lookup_type_trait_impls_mocked(self, monkeypatch):
+        snapshot = docs.RustdocSnapshot(
+            crate_name="mylib",
+            version="0.1.0",
+            version_source="explicit",
+            format_version=57,
+            target_triple="x86_64-unknown-linux-gnu",
+            root_id="0",
+            index={
+                "1": {
+                    "id": 1,
+                    "name": "MyStruct",
+                    "visibility": "public",
+                    "inner": {
+                        "struct": {
+                            "kind": {"plain": {"fields": [], "has_stripped_fields": False}},
+                            "generics": {"params": [], "where_predicates": []},
+                            "impls": [10, 11, 12, 13],
+                        }
+                    },
+                },
+                "10": {
+                    "id": 10,
+                    "name": None,
+                    "visibility": "public",
+                    "inner": {
+                        "impl": {
+                            "trait": {"path": "Debug", "id": 900, "args": None},
+                            "for": {"resolved_path": {"path": "MyStruct", "id": 1, "args": None}},
+                            "blanket_impl": None,
+                            "is_synthetic": False,
+                            "is_negative": False,
+                            "is_unsafe": False,
+                            "items": [100],
+                            "provided_trait_methods": [],
+                            "generics": {"params": [], "where_predicates": []},
+                        }
+                    },
+                },
+                "11": {
+                    "id": 11,
+                    "name": None,
+                    "visibility": "public",
+                    "inner": {
+                        "impl": {
+                            "trait": None,
+                            "for": {"resolved_path": {"path": "MyStruct", "id": 1, "args": None}},
+                            "blanket_impl": None,
+                            "is_synthetic": False,
+                            "is_negative": False,
+                            "is_unsafe": False,
+                            "items": [101, 102],
+                            "provided_trait_methods": [],
+                            "generics": {"params": [], "where_predicates": []},
+                        }
+                    },
+                },
+                "12": {
+                    "id": 12,
+                    "name": None,
+                    "visibility": "public",
+                    "inner": {
+                        "impl": {
+                            "trait": {"path": "Send", "id": 901, "args": None},
+                            "for": {"resolved_path": {"path": "MyStruct", "id": 1, "args": None}},
+                            "blanket_impl": None,
+                            "is_synthetic": True,
+                            "is_negative": False,
+                            "is_unsafe": False,
+                            "items": [],
+                            "provided_trait_methods": [],
+                            "generics": {"params": [], "where_predicates": []},
+                        }
+                    },
+                },
+                "13": {
+                    "id": 13,
+                    "name": None,
+                    "visibility": "public",
+                    "inner": {
+                        "impl": {
+                            "trait": {"path": "Into", "id": 902, "args": {"angle_bracketed": {"args": [{"type": {"generic": "U"}}], "constraints": []}}},
+                            "for": {"generic": "T"},
+                            "blanket_impl": {"generic": "T"},
+                            "is_synthetic": False,
+                            "is_negative": False,
+                            "is_unsafe": False,
+                            "items": [103],
+                            "provided_trait_methods": [],
+                            "generics": {"params": [{"name": "U", "kind": {"type": {"bounds": []}}}], "where_predicates": []},
+                        }
+                    },
+                },
+            },
+            paths={
+                "1": {"crate_id": 0, "path": ["mylib", "MyStruct"], "kind": "struct"},
+                "900": {"crate_id": 1, "path": ["core", "fmt", "Debug"], "kind": "trait"},
+                "901": {"crate_id": 1, "path": ["core", "marker", "Send"], "kind": "trait"},
+                "902": {"crate_id": 1, "path": ["core", "convert", "Into"], "kind": "trait"},
+            },
+            external_crates={"1": {"name": "core", "html_root_url": None}},
+            local_key_to_id={"mylib/struct.MyStruct": "1"},
+            id_to_local_key={"1": "mylib/struct.MyStruct"},
+            alias_local_key_to_id={},
+        )
+
+        async def fake_get_snapshot(crate_name, version=None, target=None, rustdoc_format=None):
+            return snapshot
+
+        monkeypatch.setattr(docs, "get_rustdoc_snapshot", fake_get_snapshot)
+
+        result = await lookup_type_trait_impls(
+            "mylib/0.1.0/mylib/struct.MyStruct"
+        )
+        assert result.get("error") is None
+        assert result["kind"] == "struct"
+        assert result["name"] == "MyStruct"
+        assert result["direct_count"] == 1
+        assert result["auto_count"] == 1
+        assert result["blanket_count"] == 1
+        assert result["inherent_impl_count"] == 1
+
+        trait_names = [t["trait_name"] for t in result["trait_impls"]]
+        assert "Debug" in trait_names
+
+        assert "Send" in result["auto_traits"]
+
+        blanket_names = [b["trait_name"] for b in result["blanket_impls"]]
+        assert any("Into" in n for n in blanket_names)
+
+    async def test_lookup_type_trait_impls_rejects_trait_key(self, monkeypatch):
+        snapshot = docs.RustdocSnapshot(
+            crate_name="mylib",
+            version="0.1.0",
+            version_source="explicit",
+            format_version=57,
+            target_triple="x86_64-unknown-linux-gnu",
+            root_id="0",
+            index={
+                "2": {
+                    "id": 2,
+                    "name": "MyTrait",
+                    "visibility": "public",
+                    "inner": {
+                        "trait": {
+                            "generics": {"params": [], "where_predicates": []},
+                            "bounds": [],
+                            "implementations": [],
+                            "is_unsafe": False,
+                        }
+                    },
+                },
+            },
+            paths={"2": {"crate_id": 0, "path": ["mylib", "MyTrait"], "kind": "trait"}},
+            external_crates={},
+            local_key_to_id={"mylib/trait.MyTrait": "2"},
+            id_to_local_key={"2": "mylib/trait.MyTrait"},
+            alias_local_key_to_id={},
+        )
+
+        async def fake_get_snapshot(crate_name, version=None, target=None, rustdoc_format=None):
+            return snapshot
+
+        monkeypatch.setattr(docs, "get_rustdoc_snapshot", fake_get_snapshot)
+
+        result = await lookup_type_trait_impls(
+            "mylib/0.1.0/mylib/trait.MyTrait"
+        )
+        assert result.get("error") == "rustdoc_item_not_a_type"
+
+    async def test_lookup_type_trait_impls_integration(self):
+        result = await lookup_type_trait_impls(
+            "docs.rs://tokio/latest/tokio/runtime/struct.Runtime"
+        )
+        assert result.get("error") is None
+        assert result["kind"] == "struct"
+        assert result["name"] == "Runtime"
+        assert isinstance(result["trait_impls"], list)
+        assert isinstance(result["auto_traits"], list)
+        assert isinstance(result["blanket_impls"], list)
+        assert result["direct_count"] >= 1
+        assert isinstance(result["format_version"], int)
+        assert isinstance(result["target_triple"], str)
